@@ -319,6 +319,10 @@ def prepare(args):
     if not existing and config["buff_group_sync"] == "auto":
         config["buff_group_sync"] = buff_group_sync
     management_token(config)
+    if not config.get("player_proxy_secret"):
+        config["player_proxy_secret"] = secrets.token_hex(24)
+    if not re.fullmatch(r"[0-9a-f]{32,128}", str(config["player_proxy_secret"])):
+        raise ValueError("player_proxy_secret must be a generated hex secret of at least 32 characters")
     channel_source = selected_channel_table(config, getattr(args, "channel_info", None), existing)
     private_ipv4(config["host_ip"])
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
@@ -548,6 +552,7 @@ create_databases = false
         "DNFBRIDGE_PARTY_UDP_RELAY_PORT_COUNT": str(relay_count), "DNFBRIDGE_ACCOUNT_API_LISTEN": c["server_ip"] + ":17002",
         "DNFBRIDGE_ACCOUNT_API_DSN": dsn, "DNFBRIDGE_ACCOUNT_API_ALLOW_REGISTER": "true",
         "DNFBRIDGE_ACCOUNT_API_LOGIN_TOKEN": "true", "DNFBRIDGE_PACKET_LOG": str(c.get("packet_log", False)).lower(),
+        "DNFBRIDGE_PLAYER_STRICT": "true", "DNFBRIDGE_PLAYER_PROXY_SECRET": c["player_proxy_secret"],
         "DNFBRIDGE_JOUST_EVENT_ENABLED": str(c["joust_event_enabled"]).lower(),
         "GOMEMLIMIT": c.get("go_memory_limit", "3500MiB"),
         "TZ": c.get("timezone", "Asia/Shanghai"),
