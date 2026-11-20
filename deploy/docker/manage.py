@@ -226,6 +226,21 @@ def detect_ip():
         return private_ipv4(connection.getsockname()[0])
 
 
+def public_ipv4(value):
+    """Explicit public/NAT address advertised to clients (opt-in, not a local interface)."""
+    address = ipaddress.IPv4Address(value)
+    if address.is_unspecified or address.is_loopback or address.is_link_local or address.is_multicast:
+        raise ValueError("--advertise-ip must be a routable IPv4 address")
+    return str(address)
+
+
+def bind_ipv4(value):
+    """Interface the published game ports bind to; 0.0.0.0 only in explicitly public mode."""
+    if str(value).strip() == "0.0.0.0":
+        return "0.0.0.0"
+    return private_ipv4(value)
+
+
 def build():
     run("docker", "build", "-t", IMAGE, "-f", ROOT / "deploy/docker/Dockerfile", ROOT)
 
@@ -288,6 +303,17 @@ def prepare(args):
         }
     if getattr(args, "buff_group_sync", None) is not None:
         config["buff_group_sync"] = args.buff_group_sync
+    # Public (EIP/NAT) deployments: the address clients must dial differs from the
+    # LAN address the host actually owns. Both are explicit opt-ins; leaving them
+    # unset keeps the original private-LAN-only behaviour.
+    if getattr(args, "advertise_ip", None):
+        config["advertise_ip"] = public_ipv4(args.advertise_ip)
+    if getattr(args, "bind_ip", None):
+        config["bind_ip"] = bind_ipv4(args.bind_ip)
+    if config.get("advertise_ip") is not None:
+        config["advertise_ip"] = public_ipv4(config["advertise_ip"])
+    if config.get("bind_ip") is not None:
+        config["bind_ip"] = bind_ipv4(config["bind_ip"])
     compatibility = runtime_compatibility_env(config)
     buff_group_sync = buff_group_sync_env(config, compatibility)
     if not existing and config["buff_group_sync"] == "auto":
@@ -361,6 +387,10 @@ def performance_resource_config(config):
 
 def generate(c, catalog):
     c = performance_resource_config(c)
+    # Public mode: advertise the NAT/EIP address but keep listening on the LAN interface
+    # unless the operator explicitly asked to bind the wildcard.
+    advertise = c.get("advertise_ip") or c["host_ip"]
+    bind = c.get("bind_ip") or c["host_ip"]
     owner_range = c.get("channel_directory_owner_range")
     if "channel_directory_owner_range" in c and owner_range not in ("off", "u8"):
         raise ValueError("channel_directory_owner_range must be off or u8")
@@ -443,7 +473,7 @@ def generate(c, catalog):
 name = "dnfbridge"
 node_id = "dnfbridge-docker-1"
 environment = "local"
-public_addr = "{c['host_ip']}:7001"
+public_addr = "{advertise}:7001"
 private_addr = "{c['server_ip']}:18111"
 [cluster]
 id = "local"
@@ -506,7 +536,7 @@ create_databases = false
         "DNFBRIDGE_GUILD_CONTRIBUTION_POLICY": contribution_policy,
         "DNFBRIDGE_GUILD_HONGBAO_ENABLED": str(guild_hongbao).lower(),
         "DNFBRIDGE_CHANNEL_LISTEN": c["server_ip"] + ":7001",
-        "DNFBRIDGE_GAME_LISTEN_HOST": c["server_ip"], "DNFBRIDGE_SERVER_IP": c["host_ip"],
+        "DNFBRIDGE_GAME_LISTEN_HOST": c["server_ip"], "DNFBRIDGE_SERVER_IP": advertise,
         "DNFBRIDGE_CHANNEL_INFO_PATH": "data/dnf/" + c.get("channel_file", "channel_info.etc"), "DNFBRIDGE_PVF_PATH": "data/dnf/Script.pvf",
         "DNFBRIDGE_CHANNEL_INFO_BODY_MODE": "latest", "DNFBRIDGE_CHANNEL_SERVER_INDEX": "1",
         "DNFBRIDGE_CHANNEL_ADVERTISE_SERVER_INDEX": str(advertised_server), "DNF_SCRIPT_VERSION": "59",
@@ -560,9 +590,9 @@ create_databases = false
                        "env_file": ["server.env"], "volumes": ["./server:/runtime", "./data:/runtime/data/dnf:ro"],
                        "depends_on": {"db": {"condition": "service_healthy"}}, "mem_limit": c.get("server_memory_limit", "4g"), "logging": logging,
                        "networks": {"private": {"ipv4_address": c["server_ip"]}},
-                       "ports": [f"127.0.0.1:{p}:{p}/tcp" for p in (7001, 17002, 18111)] +
-                                [f"{c['host_ip']}:{p}:{p}/tcp" for p in catalog["ports"]] +
-                                [f"{c['host_ip']}:30000-{29999 + relay_count}:30000-{29999 + relay_count}/udp"],
+                       "ports": [f"127.0.0.1:17002:17002/tcp", f"127.0.0.1:18111:18111/tcp", f"{bind}:7001:7001/tcp"] +
+                                [f"{bind}:{p}:{p}/tcp" for p in catalog["ports"]] +
+                                [f"{bind}:30000-{29999 + relay_count}:30000-{29999 + relay_count}/udp"],
                        "healthcheck": {"test": ["CMD", "wget", "-Y", "off", "-q", "-O", "/dev/null", f"http://{c['server_ip']}:17002/api/status"],
                                        "start_period": "180s", "interval": "10s", "timeout": "5s", "retries": 12}},
         },
@@ -584,6 +614,10 @@ def main():
     parser.add_argument("action", choices=("prepare", "build", "up", "down", "status", "logs"))
     parser.add_argument("--pvf")
     parser.add_argument("--host-ip")
+    parser.add_argument("--advertise-ip",
+                        help="Public/NAT address advertised to clients (e.g. an EIP); opt-in, leaves the LAN-only default untouched")
+    parser.add_argument("--bind-ip",
+                        help="Interface for published game ports; 0.0.0.0 in explicit public mode")
     parser.add_argument("--client-dir")
     parser.add_argument("--buff-group-sync", choices=("auto", "on", "off"),
                         help="Fresh installs select V212+ automatically; use off only for a legacy client")
