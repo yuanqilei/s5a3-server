@@ -1,0 +1,41 @@
+# 凭据与隐私
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+*.kdbx
+*.dpapi
+
+# 真实数据与备份（DB 结构/迁移脚本 *.sql 需保留，只忽略备份命名）
+*.bak
+*.dump
+*.sql.bak
+/data/
+/data2/
+/runtime/
+player_data/
+
+# 大文件（放 Release / 对象存储）
+*.pvf
+*.npk
+*.zip
+*.7z
+*.rar
+*.exe
+*.dll
+*.msi
+
+# 临时与构建产物
+build/
+dist/
+out/
+obj/
+*.log
+*.tmp
+*.swp
+.DS_Store
+Thumbs.db
