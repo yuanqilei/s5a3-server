@@ -39,3 +39,7 @@ obj/
 *.swp
 .DS_Store
 Thumbs.db
+
+# Python 缓存（prepare/工具运行产生）
+__pycache__/
+*.pyc
