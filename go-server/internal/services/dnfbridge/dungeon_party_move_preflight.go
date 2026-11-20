@@ -1,0 +1,97 @@
+package dnfbridge
+
+import (
+	"fmt"
+
+	"longheng.io/server/internal/modules/dnf/dungeoncmd"
+)
+
+// Check resident room ownership before sending the leader's op29. This is not
+// a door-position quorum: internal follower movement carries no client arrival
+// evidence. No dungeon lock is held while acquiring another member's lock.
+// Members may still disconnect after this check; socket writes are not atomic.
+func (s *Service) preflightRuntimePartyRoomOwners(leader *gameSession, request dungeoncmd.MoveMapRequest) error {
+	_, err := s.prepareRuntimePartyRoomMoveTargets(leader, request)
+	return err
+}
+
+func (s *Service) prepareRuntimePartyRoomMoveTargets(leader *gameSession, request dungeoncmd.MoveMapRequest) (map[uint16]partyRoomMoveTarget, error) {
+	if leader == nil || leader.selectedCharacterID == 0 {
+		return nil, nil
+	}
+	state := s.runtimePartyStateForSession(leader)
+	if state.PartyID <= 0 || state.UserID != leader.selectedCharacterID {
+		return nil, nil
+	}
+	leader.dungeon.mu.Lock()
+	runtime := leader.dungeon.runtime
+	if runtime == nil || runtime.Session == nil || runtime.Room == nil {
+		leader.dungeon.mu.Unlock()
+		return nil, nil // The established local move handler owns this refusal.
+	}
+	scene, ok := runtime.Session.Scene()
+	if !ok || (scene.Coordinate.X == int64(request.NextX) && scene.Coordinate.Y == int64(request.NextY)) {
+		leader.dungeon.mu.Unlock()
+		return nil, nil // Keep the existing same-coordinate layer/ACK path unchanged.
+	}
+	source := runtimeDungeonRoomKeyFromScene(scene)
+	dungeonID, mazeIndex, seed := runtime.Dungeon.ID, runtime.MazeIndex, runtime.Seed
+	instance := runtime.partyInstance
+	// A member can reach this exact adjacent room before the leader's op45.
+	// Preview only: the normal planner still checks source combat and topology.
+	preview, previewErr := runtime.Session.PreviewMoveByteTransition(request.NextX, request.NextY)
+	target := runtimeDungeonRoomKeyFromScene(preview.Scene)
+	leader.dungeon.mu.Unlock()
+
+	targets := make(map[uint16]partyRoomMoveTarget)
+	for _, member := range runtimePartyMembers(state) {
+		if member.UserID == 0 || member.UserID == leader.selectedCharacterID {
+			continue
+		}
+		identity, found := s.onlineGameSessionCharacterSnapshot(member.UserID)
+		follower := identity.session
+		if !found || follower == leader {
+			return nil, fmt.Errorf("party member %d has no resident game session before room transition", member.UserID)
+		}
+		followerState := s.runtimePartyStateForSession(follower)
+		if followerState.PartyID != state.PartyID || followerState.UserID != state.UserID {
+			return nil, fmt.Errorf("party member %d changed party before room transition", member.UserID)
+		}
+		follower.dungeon.mu.Lock()
+		err := validateRuntimePartyRoomOwner(follower.dungeon.runtime, source, dungeonID, mazeIndex, seed, instance)
+		if err != nil && instance != nil && previewErr == nil {
+			fr := follower.dungeon.runtime
+			if fr != nil && fr.Dungeon.ID == dungeonID && fr.MazeIndex == mazeIndex &&
+				runtimePartyMovePlanCommitted(fr, runtimePartyDungeonMovePlan{target: target, seed: fr.Seed, instance: instance, room: fr.Room}) {
+				err = nil
+			}
+		}
+		if err == nil && !s.boundGameSessionCharacterCurrent(identity) {
+			err = fmt.Errorf("party member binding changed during room preflight")
+		}
+		if err == nil {
+			targets[member.UserID] = snapshotPartyRoomMoveTargetLocked(identity)
+		}
+		follower.dungeon.mu.Unlock()
+		if err != nil {
+			return nil, fmt.Errorf("party member %d cannot follow room transition: %w", member.UserID, err)
+		}
+	}
+	return targets, nil
+}
+
+// Caller holds this member's dungeon lock. Validate both the session scene and
+// its cached room/seed; matching coordinates alone can name a previous run.
+func validateRuntimePartyRoomOwner(runtime *runtimeDungeonState, source runtimeDungeonRoomKey, dungeonID int64, mazeIndex int, seed uint32, instance *dungeonPartyInstance) error {
+	if runtime == nil || runtime.Session == nil || runtime.Room == nil {
+		return errDungeonWorldMapUnavailable
+	}
+	scene, ok := runtime.Session.Scene()
+	if !ok || runtimeDungeonRoomKeyFromScene(scene) != source ||
+		runtime.Dungeon.ID != dungeonID || runtime.MazeIndex != mazeIndex || runtime.Seed != seed ||
+		(instance != nil && runtime.partyInstance != instance) {
+		return fmt.Errorf("%w: party member source room/run differs from leader", errDungeonMoveRuntimeOwnerMismatch)
+	}
+	_, err := runtime.currentDungeonRoomVisit(scene)
+	return err
+}

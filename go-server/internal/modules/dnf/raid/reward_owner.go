@@ -1,0 +1,328 @@
+package raid
+
+import (
+	"context"
+	"encoding/binary"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"longheng.io/server/internal/modules/dnf/raidcurrency"
+	repo "longheng.io/server/internal/modules/dnf/repository"
+)
+
+var (
+	ErrRewardOwnerUnavailable = errors.New("raid reward asset transaction unavailable")
+	ErrRewardOwnership        = errors.New("raid reward character/account mismatch")
+	ErrRewardReceipt          = errors.New("raid reward receipt unavailable or inconsistent")
+	ErrRewardIneligible       = errors.New("raid reward minimum dungeon clear count not met")
+)
+
+// RewardAssets exposes the two inventories, optional mailbox, and optional
+// account Ledger to the placement projector. The owner alone writes the receipt
+// in character stats, in the same transaction.
+type RewardAssets struct {
+	AccountInventory *repo.AccountInventoryRecord
+	Inventory        *repo.InventoryRecord
+	Mailbox          repo.MailboxRepository
+	// Ledger is present when RequireLedger or RequireWallet is true. Wallet
+	// balances and Fate metadata share this same owned account transaction.
+	Ledger *repo.AccountRecord
+	// LedgerChanged is set by a one-shot Project callback so the bridge can
+	// request its post-commit list44 projection refresh.
+	LedgerChanged bool
+	FateGranted   uint32
+}
+
+type RewardChanges struct {
+	AccountInventory bool
+	Inventory        bool
+	Mailbox          bool
+	Ledger           bool
+}
+
+type RewardCommand struct {
+	AccountID     string
+	CharacterID   string
+	InstanceID    string
+	Mode          byte
+	Phase         byte
+	Kind          byte
+	Card          byte
+	MinimumClears uint32
+	OwnedClears   uint32
+	// SHA256 of the frozen, fully expanded reward including card and metadata.
+	Fingerprint [32]byte
+	CompletedAt time.Time
+	// RequireLedger selects the account-ledger+mailbox transaction and records
+	// the actual Fate grant. Rewards without Fate or wallet credits keep the
+	// historical mailbox/asset path and do not load Account.
+	RequireLedger bool
+	// RequireWallet selects that same transaction without creating a Fate receipt.
+	RequireWallet bool
+	Project       func(*RewardAssets) (RewardChanges, error)
+}
+
+type RewardResult struct {
+	Replayed     bool
+	FateGranted  uint32
+	FateRecorded bool
+}
+
+type RewardOwner struct {
+	settings repo.SettingsRepository
+	assets   repo.AccountCharacterAssetUnitOfWork
+}
+
+func NewRewardOwner(group repo.Group) (*RewardOwner, error) {
+	if group.AccountAssets == nil {
+		return nil, ErrRewardOwnerUnavailable
+	}
+	return &RewardOwner{assets: group.AccountAssets, settings: group.Settings}, nil
+}
+
+// Grant receives only a server-frozen entitlement. It does not roll rewards,
+// consume a bag container, infer a phase clear, or commit a weekly clear.
+// Each character has one receipt per instance/phase/kind, independent of card;
+// changing the card or outcome cannot obtain a second reward of that kind.
+func (o *RewardOwner) Grant(ctx context.Context, cmd RewardCommand) (RewardResult, error) {
+	return o.grant(ctx, cmd, false)
+}
+
+// RefundFiendWarEntry returns only a server-frozen failed-attempt ticket. Its
+// receipt is separate from every clear reward and never creates eligibility.
+func (o *RewardOwner) RefundFiendWarEntry(ctx context.Context, cmd RewardCommand) (RewardResult, error) {
+	if cmd.Mode != 3 || cmd.Phase != 0 || cmd.Kind != 4 || cmd.Card != 0 || cmd.MinimumClears != 0 || cmd.OwnedClears != 0 {
+		return RewardResult{}, ErrRewardReceipt
+	}
+	return o.grant(ctx, cmd, true)
+}
+func (o *RewardOwner) grant(ctx context.Context, cmd RewardCommand, refund bool) (RewardResult, error) {
+	if o == nil || o.assets == nil {
+		return RewardResult{}, ErrRewardOwnerUnavailable
+	}
+	instance, err := hex.DecodeString(cmd.InstanceID)
+	if err != nil || len(instance) != 16 || (cmd.Mode != 1 && cmd.Mode != 2 && cmd.Mode != 3) || cmd.Mode == 3 && (cmd.Phase != 0 || cmd.Card > 7) || cmd.Phase > 1 || cmd.Kind < 1 || cmd.Kind > 3 && !refund || cmd.Card > 19 ||
+		strings.TrimSpace(cmd.AccountID) == "" || strings.TrimSpace(cmd.CharacterID) == "" ||
+		cmd.AccountID != strings.TrimSpace(cmd.AccountID) || cmd.CharacterID != strings.TrimSpace(cmd.CharacterID) ||
+		cmd.Fingerprint == [32]byte{} || cmd.CompletedAt.IsZero() || cmd.CompletedAt.Unix() <= 0 || cmd.Project == nil {
+		return RewardResult{}, ErrRewardReceipt
+	}
+	if !refund && (cmd.MinimumClears == 0 && !(cmd.Mode == 2 && cmd.Phase == 0) || cmd.OwnedClears < cmd.MinimumClears) {
+		return RewardResult{}, ErrRewardIneligible
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return RewardResult{}, err
+	}
+	marker := fmt.Sprintf("raid_reward_v1_%d_%s_%d_%d", cmd.Mode, hex.EncodeToString(instance), cmd.Phase, cmd.Kind)
+	requireAccount := cmd.RequireLedger || cmd.RequireWallet
+	result := RewardResult{}
+	apply := func(
+		ledger repo.AccountRepository,
+		accounts repo.AccountInventoryRepository, chars repo.CharacterRepository,
+		inventories repo.InventoryRepository, _ repo.EquipmentRepository, mailboxes repo.MailboxRepository,
+	) error {
+		if accounts == nil || chars == nil || inventories == nil {
+			return ErrRewardOwnerUnavailable
+		}
+		character, found, err := chars.Load(ctx, cmd.CharacterID)
+		if err != nil {
+			return err
+		}
+		if !found || character.CharacterID != cmd.CharacterID || character.AccountID != cmd.AccountID {
+			return ErrRewardOwnership
+		}
+		stamp, marked := character.Stats[marker]
+		card, hasCard := character.Stats[marker+"_card"]
+		parts := [4]int64{}
+		have := 0
+		for i := range parts {
+			var exists bool
+			parts[i], exists = character.Stats[fmt.Sprintf("%s_hash%d", marker, i)]
+			if exists {
+				have++
+			}
+		}
+		if marked || hasCard || have != 0 {
+			if !marked || !hasCard || have != 4 || stamp <= 0 || stamp > cmd.CompletedAt.Unix() || card != int64(cmd.Card)+1 {
+				return ErrRewardReceipt
+			}
+			for i, part := range parts {
+				if uint64(part) != binary.LittleEndian.Uint64(cmd.Fingerprint[i*8:(i+1)*8]) {
+					return ErrRewardReceipt
+				}
+			}
+			result.Replayed = true
+			if granted, found := character.Stats[marker+"_fate"]; found {
+				if !cmd.RequireLedger || granted < 0 || granted > int64(raidcurrency.WeeklyLimit) {
+					return ErrRewardReceipt
+				}
+				result.FateGranted, result.FateRecorded = uint32(granted), true
+			}
+			return nil
+		}
+		var ledgerRecord *repo.AccountRecord
+		if requireAccount {
+			if ledger == nil {
+				return ErrRewardOwnerUnavailable
+			}
+			record, found, err := ledger.Load(ctx, cmd.AccountID)
+			if err != nil {
+				return err
+			}
+			if !found || record.AccountID != cmd.AccountID {
+				return ErrRewardOwnership
+			}
+			record = repo.CloneAccount(record)
+			ledgerRecord = &record
+		}
+		inventory, found, err := inventories.Load(ctx, cmd.CharacterID)
+		if err != nil {
+			return err
+		}
+		if !found || inventory.CharacterID != cmd.CharacterID {
+			return ErrRewardOwnerUnavailable
+		}
+		account, _, err := accounts.Load(ctx, cmd.AccountID)
+		if err != nil {
+			return err
+		}
+		account = repo.CloneAccountInventory(account)
+		account.AccountID = cmd.AccountID
+		if account.Slots == nil {
+			account.Slots = map[string]repo.ItemStack{}
+		}
+		if err := repo.BindInventoryContainerState(ctx, o.settings, &inventory); err != nil {
+			return err
+		}
+		inventory = repo.CloneInventory(inventory)
+		// An existing empty inventory is stored and cloned with a nil slot map.
+		// It is valid reward space; initialize the owned copy before projection.
+		if inventory.Slots == nil {
+			inventory.Slots = map[string]repo.ItemStack{}
+		}
+		character = repo.CloneCharacter(character)
+		assets := &RewardAssets{AccountInventory: &account, Inventory: &inventory, Mailbox: mailboxes, Ledger: ledgerRecord}
+		fateBefore := repo.BattlePassFateCount(inventory.Slots, account.Slots)
+		var ledgerFateBefore raidcurrency.State
+		if cmd.RequireLedger {
+			ledgerFateBefore, err = raidcurrency.Read(*ledgerRecord, cmd.CompletedAt)
+			if err != nil {
+				return err
+			}
+		}
+		changes, err := cmd.Project(assets)
+		if err != nil {
+			return err
+		}
+		if changes.Mailbox && mailboxes == nil {
+			return ErrRewardOwnerUnavailable
+		}
+		if requireAccount != changes.Ledger {
+			return ErrRewardReceipt
+		}
+		if !changes.Inventory && !changes.AccountInventory && !changes.Mailbox && !changes.Ledger {
+			return ErrRewardReceipt
+		}
+		if account.AccountID != cmd.AccountID || inventory.CharacterID != cmd.CharacterID || account.Slots == nil || inventory.Slots == nil {
+			return ErrRewardOwnership
+		}
+		if character.Stats == nil {
+			character.Stats = map[string]int64{}
+		}
+		gained := repo.BattlePassFateCount(inventory.Slots, account.Slots) - fateBefore
+		if cmd.RequireLedger {
+			// Current raid Fate is an account currency, not a bag stack. Count
+			// the committed acquisition delta, including the actual weekly cap,
+			// in the same transaction as the reward receipt. Replays return above.
+			after, err := raidcurrency.Read(*ledgerRecord, cmd.CompletedAt)
+			if err != nil {
+				return err
+			}
+			gained = int64(after.Earned) - int64(ledgerFateBefore.Earned)
+		}
+		if gained > 0 {
+			repo.AddBattlePassCounter(&character, 43, -1, gained, cmd.CompletedAt)
+		}
+		character.Stats[marker] = cmd.CompletedAt.Unix()
+		character.Stats[marker+"_card"] = int64(cmd.Card) + 1
+		if cmd.RequireLedger {
+			if assets.FateGranted > raidcurrency.WeeklyLimit {
+				return ErrRewardReceipt
+			}
+			character.Stats[marker+"_fate"] = int64(assets.FateGranted)
+			character.Stats[marker+"_bp_fate_v1"] = 1
+			result.FateGranted, result.FateRecorded = assets.FateGranted, true
+		}
+		for i := 0; i < 4; i++ {
+			character.Stats[fmt.Sprintf("%s_hash%d", marker, i)] = int64(binary.LittleEndian.Uint64(cmd.Fingerprint[i*8 : (i+1)*8]))
+		}
+		character.UpdatedAt = cmd.CompletedAt.UTC()
+		if changes.Ledger {
+			if ledgerRecord == nil || ledgerRecord.AccountID != cmd.AccountID {
+				return ErrRewardOwnership
+			}
+			ledgerRecord.UpdatedAt = cmd.CompletedAt.UTC()
+			if err := ledger.Save(ctx, *ledgerRecord); err != nil {
+				return err
+			}
+		}
+		if changes.Inventory {
+			inventory.UpdatedAt = cmd.CompletedAt.UTC()
+			if err := repo.SaveInventoryFields(ctx, inventories, inventory, repo.InventoryFieldSlots); err != nil {
+				return err
+			}
+		}
+		if changes.AccountInventory {
+			account.UpdatedAt = cmd.CompletedAt.UTC()
+			if err := accounts.Save(ctx, account); err != nil {
+				return err
+			}
+		}
+		return repo.SaveCharacterFields(ctx, chars, character, repo.CharacterFieldStats)
+	}
+	if requireAccount {
+		withLedger, ok := o.assets.(repo.AccountCharacterLedgerMailboxAssetUnitOfWork)
+		if !ok {
+			return RewardResult{}, ErrRewardOwnerUnavailable
+		}
+		err = withLedger.WithinAccountCharacterLedgerMailboxAssets(ctx, cmd.AccountID, cmd.CharacterID, func(
+			ledger repo.AccountRepository,
+			accounts repo.AccountInventoryRepository,
+			chars repo.CharacterRepository,
+			inventories repo.InventoryRepository,
+			equipment repo.EquipmentRepository,
+			mailboxes repo.MailboxRepository,
+		) error {
+			return apply(ledger, accounts, chars, inventories, equipment, mailboxes)
+		})
+	} else if withMail, ok := o.assets.(repo.AccountCharacterMailboxAssetUnitOfWork); ok {
+		err = withMail.WithinAccountCharacterMailboxAssets(ctx, cmd.AccountID, cmd.CharacterID, func(
+			accounts repo.AccountInventoryRepository,
+			chars repo.CharacterRepository,
+			inventories repo.InventoryRepository,
+			equipment repo.EquipmentRepository,
+			mailboxes repo.MailboxRepository,
+		) error {
+			return apply(nil, accounts, chars, inventories, equipment, mailboxes)
+		})
+	} else {
+		// Existing custom UOWs still support normal inventory rewards. A full bag
+		// cannot be acknowledged as mail unless this transaction supplies it.
+		err = o.assets.WithinAccountCharacterAssets(ctx, cmd.AccountID, cmd.CharacterID, func(a repo.AccountInventoryRepository, c repo.CharacterRepository, i repo.InventoryRepository, e repo.EquipmentRepository) error {
+			return apply(nil, a, c, i, e, nil)
+		})
+	}
+	if errors.Is(err, repo.ErrAccountCharacterMailboxOwnership) {
+		return RewardResult{}, errors.Join(ErrRewardOwnership, err)
+	}
+	if err != nil {
+		return RewardResult{}, err
+	}
+	return result, nil
+}

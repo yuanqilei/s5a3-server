@@ -1,0 +1,154 @@
+package dnfbridge
+
+import (
+	"context"
+	"fmt"
+	"longheng.io/server/internal/modules/dnf/pvf"
+	"longheng.io/server/internal/modules/dnf/raid"
+	"longheng.io/server/internal/modules/dnf/worldmap"
+	"strings"
+)
+
+func currentLukeDungeonCoinLimit(d worldmap.Dungeon) (uint32, error) {
+	var limit uint32
+	found := false
+	for _, sec := range d.SourceSections {
+		if !strings.EqualFold(strings.TrimSpace(sec.Name), "coin limit") {
+			continue
+		}
+		if found || len(sec.Tokens) != 1 || sec.Tokens[0].Kind != pvf.TokenInt || sec.Tokens[0].Int < 0 || sec.Tokens[0].Int > 255 {
+			return 0, fmt.Errorf("invalid actual Luke dungeon coin limit")
+		}
+		found = true
+		limit = uint32(sec.Tokens[0].Int)
+	}
+	return limit, nil
+}
+
+// Caller holds this session's dungeon.mu. Keep the exact shared raid owner
+// fixed through the existing asset transaction; no quota is reserved/refunded.
+// raidMu and Service.mu are held during DB work, so slow DB work can delay other
+// raids/sessions. The inherited 3s context is cooperative, not a hard preemption
+// guarantee for arbitrary repositories or an uncertain SQL commit result.
+func (s *Service) consumeCurrentDungeonReviveCoinWithLukeCaps(ctx context.Context, session *gameSession, r *runtimeDungeonState, char uint16) (currentDungeonReviveCoinConsumeResult, error) {
+	empty := currentDungeonReviveCoinConsumeResult{}
+	if s.options.currentClientVersion != "official-24.9" || session == nil {
+		return s.consumeCurrentDungeonReviveCoin(ctx, char)
+	}
+	// Preserve ordinary and Anton behavior. A frozen Luke entry still requires
+	// its owner even if the current session's channel was subsequently changed.
+	isLuke := session.channel.Type == 32 || r != nil && r.raidEntry != nil && r.raidEntry.ChannelType == 32
+	if !isLuke {
+		return s.consumeCurrentDungeonReviveCoin(ctx, char)
+	}
+	// Keep rejection identity available when packet logging is disabled. Only
+	// fixed gate names and owned runtime/quota fields leave this boundary;
+	// repository errors may contain connection details and are never forwarded.
+	auditReason := "asset_transaction_failed"
+	auditFields := []any{"char_id", char, "has_runtime", r != nil}
+	if r != nil {
+		auditFields = append(auditFields, "dungeon_id", r.Dungeon.ID)
+		if r.raidEntry != nil {
+			auditFields = append(auditFields, "run_id", r.raidEntry.RunID, "instance_id", r.raidEntry.InstanceID, "entry_phase", r.raidEntry.Phase, "entry_attempt", r.raidEntry.Attempt)
+		}
+	}
+	defer func() {
+		s.logGameEvent(session, "game-luke-coin-validation", append(auditFields, "reason", auditReason)...)
+	}()
+	reject := func(reason, message string) (currentDungeonReviveCoinConsumeResult, error) {
+		auditReason = reason
+		return empty, fmt.Errorf("%s", message)
+	}
+	identity, bound := s.boundGameSessionCharacterSnapshot(session)
+	if !bound || identity.character != char || !s.currentRaidAuthenticated(session) || r == nil || r.raidEntry == nil || r.Session == nil || r.Session.Snapshot().Run.Status != worldmap.DungeonRunActive || !dungeonRuntimeOwnsCharacter(r, char) || r.townReturnPending || !r.deathReturnWaiting || !r.deathStateSent || !session.postStartMapPlayerStateSent {
+		return reject("accepted_death_owner_required", "Luke coin requires accepted death in current committed owned run")
+	}
+	mapLimit, e := currentLukeDungeonCoinLimit(r.Dungeon)
+	if e != nil {
+		auditReason = "map_limit_resource_invalid"
+		return empty, e
+	}
+	now := s.gameplayNow()
+	s.raidMu.Lock()
+	defer s.raidMu.Unlock()
+	state := s.runtimeRaidByMemberLocked(char)
+	entry := r.raidEntry
+	if state == nil || !state.Started || state.Battle == nil || state.RaidKey != entry.RaidKey {
+		return reject("raid_owner_missing", "Luke coin raid owner missing")
+	}
+	b := state.Battle
+	auditFields = append(auditFields, "phase", b.Phase, "map_coin_used", b.RunCoins[entry.RunID], "map_coin_limit", mapLimit)
+	if b.Phase < 2 {
+		auditFields = append(auditFields, "phase_coin_used", b.PhaseCoins[b.Phase], "phase_coin_limit", b.Configuration.PhaseCoinLimits[b.Phase])
+	}
+	if b.Single || b.Mode != 2 || b.Anton == nil || !b.Anton.IsLuke() || b.InstanceID != entry.InstanceID || b.Phase != entry.Phase || b.Phase > 1 || b.Anton.Epoch() != entry.Attempt || entry.RunID == "" || b.ChannelID != entry.ChannelID || b.ChannelType != entry.ChannelType || session.channel.ID != entry.ChannelID || session.channel.Type != entry.ChannelType || b.MemberAccounts[char] != r.AccountID || r.AccountID != s.accountIDForSession(session) || b.PhaseCompleted || b.TimedOut || now.Before(b.EnterAfter) || !now.Before(b.Deadline) || now.Before(b.Anton.LastTime()) {
+		return reject("binding_expired", "Luke coin binding expired")
+	}
+	participant := false
+	for _, id := range entry.Participants {
+		participant = participant || id == char
+	}
+	if !participant {
+		return reject("participant_not_frozen", "Luke coin participant not frozen")
+	}
+	if _, done := b.ClearedRuns[entry.RunID]; done {
+		return reject("run_already_completed", "Luke coin run completed")
+	}
+	open := false
+	for _, d := range b.Dungeons {
+		open = open || int64(d.ID) == r.Dungeon.ID && d.State == 0
+	}
+	if !open || !(&raid.LukeProgression{AntonProgression: b.Anton}).HasEnteredRun(entry.RunID, uint32(r.Dungeon.ID)) {
+		return reject("dungeon_unavailable", "Luke coin dungeon unavailable")
+	}
+	life, found := b.MemberLives[currentRaidMemberRun{RunID: entry.RunID, CharacterID: char}]
+	if !found || !life.Dead || life.Phase != entry.Phase || life.Attempt != entry.Attempt {
+		return reject("death_journal_missing", "Luke coin has no accepted owned death journal")
+	}
+	phaseLimit := b.Configuration.PhaseCoinLimits[b.Phase]
+	if phaseLimit > 0 && b.PhaseCoins[b.Phase] >= phaseLimit {
+		return reject("phase_coin_limit_reached", "Luke revive coin limit reached")
+	}
+	if mapLimit > 0 && b.RunCoins[entry.RunID] >= mapLimit {
+		return reject("map_coin_limit_reached", "Luke revive coin limit reached")
+	}
+	if mapLimit > 0 && len(b.RunCoins) >= 4096 {
+		if _, exists := b.RunCoins[entry.RunID]; !exists {
+			return reject("run_journal_limit", "Luke coin run journal limit")
+		}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.gameSessions[char] != session || session.selectedCharacterID != identity.character || session.characterGeneration != identity.generation || session.events != nil && !session.events.active.Load() {
+		return reject("canonical_session_changed", "Luke coin canonical session changed")
+	}
+	coinCtx, cancel := context.WithDeadline(ctx, b.Deadline)
+	defer cancel()
+	result, e := s.consumeCurrentDungeonReviveCoin(coinCtx, char)
+	if e != nil || !result.Consumed && !result.FreeRevive {
+		if e == nil {
+			auditReason = "coin_unavailable"
+		}
+		return result, e
+	}
+	// Phase scope survives re-entry; shared run scope resets by a new run ID.
+	// Counts are changed only after the physical asset UOW reports success.
+	if phaseLimit > 0 {
+		b.PhaseCoins[b.Phase]++
+	}
+	if mapLimit > 0 {
+		if b.RunCoins == nil {
+			b.RunCoins = map[string]uint32{}
+		}
+		b.RunCoins[entry.RunID]++
+	}
+	if phaseLimit > 0 {
+		// Native NOTI775 writes the client's shared raid count. Publish only
+		// committed counts and let the serialized projection select latest state.
+		b.ProgressVersion++
+		projection := cloneRuntimeRaidState(*state)
+		result.RaidCoinProjection = &projection
+	}
+	auditReason = "accepted"
+	return result, nil
+}

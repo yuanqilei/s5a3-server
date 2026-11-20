@@ -1,0 +1,1800 @@
+// raid_online.go 负责当前 game 连接内的攻坚队运行态流程。
+// 这里只保存在线会话可见的短生命周期攻坚队，不落 DB；跨服持久 owner 后续再替换该边界。
+package dnfbridge
+
+import (
+	"context"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"sort"
+	"strconv"
+	"time"
+
+	"longheng.io/server/internal/modules/dnf/alignedcmd"
+	"longheng.io/server/internal/modules/dnf/dnfenum"
+	"longheng.io/server/internal/modules/dnf/party"
+	dnfproto "longheng.io/server/internal/modules/dnf/protocol"
+	"longheng.io/server/internal/modules/dnf/raid"
+)
+
+const (
+	runtimeRaidDefaultGroup = 1
+	runtimeRaidMaxGroups    = 10
+	runtimeRaidGroupSize    = 4
+	runtimeRaidFailureCode  = 3
+)
+
+type runtimeRaidState struct {
+	RaidKey         uint32
+	LeaderID        uint16
+	RouteOrRaidType byte
+	NameBytes       []byte
+	TailFlag        byte
+	Members         []runtimeRaidMemberState
+	Started         bool
+	CurrentLayout   bool
+	CurrentUIFlags  [3]byte
+	Battle          *runtimeRaidBattle
+}
+
+type runtimeRaidMemberState struct {
+	CharID     uint16
+	Name       string
+	GroupIndex byte
+	SlotOrder  byte
+	UserState  byte
+	HPPercent  byte
+	MPPercent  byte
+	Job        byte
+	GrowType   byte
+	Level      uint32
+	// OrdinaryPartySolo reflects actual party membership or explicit recruiting
+	// intent. Normal current-client raid start keeps these members independent;
+	// its automatic admission seats are not requests to form an ordinary party.
+	// GroupIndex/SlotOrder remain planned seats, and Battle.MemberGroups remains
+	// the frozen reward grouping.
+	OrdinaryPartySolo bool
+	// A recruiting manager action owns this planned seat's display even before
+	// raid start materializes ordinary parties. Automatic admission seats do not.
+	RecruitingPlacementExplicit bool
+}
+
+// runtimePartyRaidExitProjection is the ordinary-party half of a successful
+// op665. The manager mutation is committed before any client notification is
+// attempted, so callers can keep publishing to the other survivors after one
+// socket write fails.
+type runtimePartyRaidExitProjection struct {
+	previous alignedcmd.PartyState
+	next     alignedcmd.PartyState
+	retired  bool
+	changed  bool
+	expected party.RuntimePartySnapshot
+}
+
+func (s *Service) leaveRuntimePartyForRaidExit(session *gameSession) (runtimePartyRaidExitProjection, error) {
+	if s == nil || session == nil {
+		return runtimePartyRaidExitProjection{}, nil
+	}
+	identity, current := s.boundGameSessionCharacterSnapshot(session)
+	if !current || !s.boundGameSessionCharacterCurrent(identity) {
+		return runtimePartyRaidExitProjection{}, nil
+	}
+	// Only retire the party generation this authenticated session currently
+	// displays. A stale cached id must not remove a newer team created after a
+	// reconnect or replacement session.
+	cached := runtimePartyStateSnapshot(session)
+	if cached.PartyID <= 0 || cached.PartyID >= int(^uint16(0)) {
+		return runtimePartyRaidExitProjection{}, nil
+	}
+	manager := s.runtimePartyManagerForService()
+	if manager == nil {
+		return runtimePartyRaidExitProjection{}, fmt.Errorf("runtime party manager unavailable")
+	}
+	before, found := manager.SnapshotByUser(identity.character, identity.generation)
+	if !found {
+		return runtimePartyRaidExitProjection{}, nil
+	}
+	if before.ID != uint16(cached.PartyID) {
+		s.logGameEvent(session, "game-raid-leave-party-sync-skipped",
+			"char_id", identity.character,
+			"session_generation", identity.generation,
+			"cached_party_id", cached.PartyID,
+			"current_party_id", before.ID,
+			"reason", "session_party_id_does_not_match_current_manager_generation")
+		return runtimePartyRaidExitProjection{}, nil
+	}
+	result := manager.LeaveExpected(identity.character, identity.generation, before.ID)
+	if !result.OK {
+		if result.Reason == "stale_session" || result.Reason == "not_in_party" || result.Reason == "stale_party" {
+			return runtimePartyRaidExitProjection{}, nil
+		}
+		return runtimePartyRaidExitProjection{}, fmt.Errorf("leave runtime party on raid exit: %s", result.Reason)
+	}
+	if result.Previous == nil || result.Previous.ID != before.ID {
+		return runtimePartyRaidExitProjection{}, fmt.Errorf("leave runtime party on raid exit changed an unexpected generation")
+	}
+	s.logRuntimePartyMembershipRemoved("raid_leave_op665", identity.character, identity.generation, before, result)
+	s.clearRuntimePartyProjection(identity.character, identity.generation)
+	next := alignedcmd.PartyState{}
+	if result.Party.ID != 0 {
+		next = s.publishRuntimePartyMembershipSnapshot(result.Party)
+	}
+	return runtimePartyRaidExitProjection{
+		previous: before.StateFor(identity.character),
+		next:     next,
+		retired:  result.Retired != nil,
+		changed:  true,
+		expected: result.Party,
+	}, nil
+}
+
+func (s *Service) currentRaidExitPartyReceiver(projection runtimePartyRaidExitProjection, id uint16) (*gameSession, bool) {
+	current, found := s.runtimePartyManagerForService().SnapshotByID(projection.expected.ID)
+	if !found || current.Leader != projection.expected.Leader || len(current.Members) != len(projection.expected.Members) {
+		return nil, false
+	}
+	for i, want := range projection.expected.Members {
+		got := current.Members[i]
+		if got.UserID != want.UserID || got.SessionGeneration != want.SessionGeneration || got.Slot != want.Slot {
+			return nil, false
+		}
+	}
+	for _, member := range current.Members {
+		if member.UserID == id {
+			identity, ok := s.onlineGameSessionCharacterSnapshot(id)
+			return identity.session, ok && identity.generation == member.SessionGeneration && s.boundGameSessionCharacterCurrent(identity)
+		}
+	}
+	return nil, false
+}
+
+// broadcastRuntimePartyRaidExit publishes the committed party transition to
+// survivors. One failed socket does not prevent later survivors from receiving
+// the removed-member projection.
+func (s *Service) broadcastRuntimePartyRaidExit(projection runtimePartyRaidExitProjection, removedID uint16, skip *gameSession) error {
+	if s == nil || !projection.changed {
+		return nil
+	}
+	if projection.retired {
+		s.closeRuntimePartyUDPRelay(projection.previous.PartyID)
+		for _, member := range runtimePartyMembers(projection.previous) {
+			if member.UserID == removedID {
+				continue
+			}
+			peer, online := s.currentRaidExitPartyReceiver(projection, member.UserID)
+			if !online || peer == skip {
+				continue
+			}
+			if err := s.sendRuntimePartyMemberRemoved(peer, removedID, alignedcmd.PartyState{}); err != nil {
+				s.failRuntimeRaidRecipient(peer, "party_exit", err)
+			}
+		}
+		if projection.next.PartyID > 0 {
+			s.syncRuntimePartyUDPRelay(projection.next)
+			for _, member := range runtimePartyMembers(projection.next) {
+				peer, online := s.currentRaidExitPartyReceiver(projection, member.UserID)
+				if !online || peer == skip {
+					continue
+				}
+				storeRuntimePartyState(peer, projection.next)
+				if err := s.sendRuntimePartySnapshot(peer, projection.next); err != nil {
+					s.failRuntimeRaidRecipient(peer, "party_exit_snapshot", err)
+				}
+			}
+		}
+	} else {
+		if projection.next.PartyID > 0 {
+			s.syncRuntimePartyUDPRelay(projection.next)
+		} else {
+			s.closeRuntimePartyUDPRelay(projection.previous.PartyID)
+		}
+		members := runtimePartyMembers(projection.next)
+		if projection.next.PartyID <= 0 {
+			members = runtimePartyMembers(projection.previous)
+		}
+		for _, member := range members {
+			if member.UserID == removedID {
+				continue
+			}
+			peer, online := s.currentRaidExitPartyReceiver(projection, member.UserID)
+			if !online || peer == skip {
+				continue
+			}
+			storeRuntimePartyState(peer, projection.next)
+			if err := s.sendRuntimePartyMemberRemoved(peer, removedID, projection.next); err != nil {
+				s.failRuntimeRaidRecipient(peer, "party_exit", err)
+			}
+		}
+	}
+	s.updateCurrentRaidSoloForPartyMembers(
+		runtimePartySoloMemberIDs(projection.previous, projection.next),
+		false,
+	)
+	return nil
+}
+
+func (s *Service) handleOnlineRaidCommand(session *gameSession, typ uint16, body []byte) (bool, error) {
+	if s.options.currentClientVersion == "official-24.9" {
+		if handled, err := s.handleCurrentRaidInvitationCommand(session, typ, body); handled || err != nil {
+			return handled, err
+		}
+		if handled, err := s.handleCurrentRaidApplicationCommand(session, typ, body); handled || err != nil {
+			return handled, err
+		}
+	}
+	if s.options.currentClientVersion == "official-24.9" && onlineRaidCommandKnown(typ) && !s.currentRaidAuthenticated(session) {
+		if dnfenum.CmdPacket(typ) == dnfenum.CmdPacketCreateRaid {
+			s.logGameEvent(session, "game-current-raid-create-rejected", "op", typ, "reason", "dispatch_authentication_rejected")
+		}
+		return true, s.sendRaidCommandFailure(session, typ)
+	}
+	switch dnfenum.CmdPacket(typ) {
+	case dnfenum.CmdPacketRaidSetSymbol:
+		if s.options.currentClientVersion == "official-24.9" {
+			if session.channel.Type == dnfenum.HiddenRaidType {
+				return true, s.handleCurrentLukeGeneratorSymbol(session, body)
+			}
+			return true, s.handleCurrentAntonEnergySymbol(session, typ, body)
+		}
+		return false, nil
+	case dnfenum.CmdPacketRaidMovieSkip:
+		if s.options.currentClientVersion == "official-24.9" {
+			return true, s.handleCurrentAntonMovieCompletion(session, typ, body)
+		}
+		return false, nil
+	case dnfenum.CmdPacketSelectRaidRewardCard:
+		if s.options.currentClientVersion == "official-24.9" {
+			return true, s.handleCurrentAntonRewardCard(session, typ, body)
+		}
+		return false, nil
+	case dnfenum.CmdPacketRaidEntryCostInfo:
+		return true, s.handleOnlineRaidEntryCostInfo(session, typ, body)
+	case dnfenum.CmdPacketCreateRaid:
+		return true, s.handleOnlineCreateRaid(session, typ, body)
+	case dnfenum.CmdPacketRequestRaidInfo:
+		return true, s.handleOnlineRequestRaidInfo(session, body)
+	case dnfenum.CmdPacketModifyRaidInfo:
+		return true, s.handleOnlineModifyRaidInfo(session, typ, body)
+	case dnfenum.CmdPacketLeaveRaid:
+		return true, s.handleOnlineLeaveRaid(session, typ, body)
+	case dnfenum.CmdPacketStartRaid:
+		return true, s.handleOnlineStartRaid(session, typ, body)
+	case dnfenum.CmdPacketRejoinRaid:
+		return true, s.handleOnlineRejoinRaid(session, typ, body)
+	case dnfenum.CmdPacketRaidManagerWork:
+		return true, s.handleOnlineRaidManagerWork(session, typ, body)
+	case dnfenum.CmdPacketRaidMemberChangeState:
+		return true, s.handleOnlineRaidMemberChangeState(session, typ, body)
+	case dnfenum.CmdPacketRaidOtherChannelList:
+		if s.options.currentClientVersion == "official-24.9" {
+			return true, s.handleCurrentRaidSearch(session, typ, body)
+		}
+		return false, nil
+	default:
+		return false, nil
+	}
+}
+
+func (s *Service) handleOnlineCreateRaid(session *gameSession, typ uint16, body []byte) error {
+	if s.options.currentClientVersion == "official-24.9" {
+		return s.handleCurrentCreateRaid(session, typ, body)
+	}
+	req, err := raid.DecodeCreateRaidRequest(body)
+	if err != nil {
+		s.logGameEvent(session, "game-raid-create-body-invalid", "type", typ, "body_len", len(body), "error", err)
+		return s.sendRaidCommandFailure(session, typ)
+	}
+	sourceID := selectedCharacterID(session)
+	if sourceID == 0 || session == nil || (session.channel.Type != dnfenum.RaidChannelType && session.channel.Type != dnfenum.HiddenRaidType) {
+		return s.sendRaidCommandFailure(session, typ)
+	}
+	state := s.createRuntimeRaid(session, sourceID, req)
+	if err := s.sendGameUpperRawClassCodec(session, typ, raid.BuildCreateRaidResultBody(state.RaidKey), dnfproto.DefaultChannelClassification, true); err != nil {
+		return err
+	}
+	if err := s.sendRuntimeRaidMetadata(session, state, 0); err != nil {
+		return err
+	}
+	if err := s.broadcastRuntimeRaidRefresh(state); err != nil {
+		return err
+	}
+	s.logGameEvent(session, "game-raid-created",
+		"type", typ,
+		"raid_key", state.RaidKey,
+		"leader_id", state.LeaderID,
+		"member_count", len(state.Members))
+	return nil
+}
+
+func (s *Service) sendRuntimeRaidMetadata(session *gameSession, state runtimeRaidState, mode uint32) error {
+	if s.options.currentClientVersion == "official-24.9" {
+		state = s.currentRaidLivePartyProjection(state)
+		body, err := buildCurrentRuntimeRaidMetadata(state, mode)
+		if err != nil {
+			return err
+		}
+		return s.sendGameUpperRawClassCodec(session, raid.RaidMemberRefreshMsgID, body, 0, true)
+	}
+	refresh := runtimeRaidMemberRefresh(state)
+	var leader raid.MemberRecord
+	for _, member := range refresh.Members {
+		if member.CharKey == state.LeaderID {
+			leader = member
+			break
+		}
+	}
+	body, err := raid.BuildMetadataBody(raid.Metadata{RaidKey: state.RaidKey, NameBytes: state.NameBytes, Route: state.RouteOrRaidType, TailFlag: state.TailFlag, Started: state.Started, Leader: leader, Members: refresh.Members}, mode)
+	if err != nil {
+		return err
+	}
+	return s.sendGameUpperRawClassCodec(session, raid.RaidMemberRefreshMsgID, body, 0, true)
+}
+
+// Captured current-client requests use u8(1), u32 raid key after CREATE_RAID;
+// retain mode2 requests supported by the earlier client trace as well.
+// Current ACK1359 returns a read-only object/roster. NOTI591 is a membership
+// update: its mode3 handler assigns the client's own raid, even for a viewer.
+func (s *Service) handleOnlineRequestRaidInfo(session *gameSession, body []byte) error {
+	if s.options.currentClientVersion == "official-24.9" && !s.currentRaidAuthenticated(session) {
+		return nil
+	}
+	if len(body) != 5 || (body[0] != 1 && body[0] != 2) {
+		return nil
+	}
+	key := binary.LittleEndian.Uint32(body[1:])
+	s.raidMu.Lock()
+	stored := s.raids[key]
+	var state runtimeRaidState
+	if stored != nil {
+		state = cloneRuntimeRaidState(*stored)
+	}
+	s.raidMu.Unlock()
+	if state.RaidKey == 0 {
+		return nil
+	}
+	if runtimeRaidMemberIndex(state, selectedCharacterID(session)) < 0 && !s.currentRaidInfoVisible(session, state) {
+		return nil
+	}
+	if s.options.currentClientVersion == "official-24.9" {
+		// Retained membership cannot bypass the selected server/channel/route.
+		// A freshly restarted member has no local own-raid key. Install the
+		// complete object through the actual ACK's idempotent upsert, then
+		// publish membership only to this authenticated member. Mode0 NOTI591
+		// would increment the directory count again on every repeated query.
+		if !s.currentRaidInfoVisible(session, state) {
+			return nil
+		}
+		member := runtimeRaidMemberIndex(state, selectedCharacterID(session)) >= 0
+		selector := body[0]
+		if member {
+			if state.Battle != nil && state.Battle.MemberAccounts[selectedCharacterID(session)] != s.accountIDForSession(session) {
+				return nil
+			}
+			selector = 2
+		}
+		state = s.currentRaidLivePartyProjection(state)
+		reply, err := raid.BuildCurrentInfoReplyBody(currentRuntimeRaidMetadata(state), selector)
+		if err != nil {
+			return err
+		}
+		s.logGameEvent(session, "game-raid-info-sent", "raid_key", key, "mode", "current_ack1359", "selector", selector)
+		profileCtx, cancelProfiles := context.WithTimeout(context.Background(), createWriteTimeout)
+		defer cancelProfiles()
+		profiles := newCurrentRaidProfileBatch(s, profileCtx)
+		if err := s.sendCurrentRuntimeRaidProfilesWithBatchForActors(session, state, profiles, nil); err != nil {
+			return s.currentRaidProfileRequestError(session, err)
+		}
+		if err := s.sendGameUpperRawClassCodec(session, uint16(dnfenum.CmdPacketRequestRaidInfo), reply, 1, true); err != nil {
+			return err
+		}
+		if member {
+			roster, err := s.buildRuntimeRaidRosterBody(state)
+			if err != nil {
+				return err
+			}
+			if err := s.sendGameUpperRawClassCodec(session, raid.RaidMemberRefreshMsgID, roster, 0, true); err != nil {
+				return err
+			}
+			return s.sendCurrentRuntimeRaidEntryCostWithBatch(session, state, &currentRaidAdmissionBatch{ctx: profiles.ctx})
+		}
+		return nil
+	}
+	if err := s.sendRuntimeRaidMetadata(session, state, 2); err != nil {
+		return err
+	}
+	body, err := s.buildRuntimeRaidRosterBody(state)
+	if err != nil {
+		return err
+	}
+	s.logGameEvent(session, "game-raid-info-sent", "raid_key", key, "mode", "metadata_update_then_real_roster")
+	return s.sendGameUpperRawClassCodec(session, raid.RaidMemberRefreshMsgID, body, 0, true)
+}
+
+// The current search UI asks for the roster before requesting membership.
+// This is read-only visibility of an existing directory object, not authority
+// to mutate it. Historical layouts retain their members-only behavior.
+func (s *Service) currentRaidInfoVisible(session *gameSession, state runtimeRaidState) bool {
+	return s.currentRaidInfoContextVisible(session, state) && s.currentRaidAuthenticated(session)
+}
+
+// Routing only. Callers must also supply either currentRaidAuthenticated or
+// this broadcast's repository-derived owner and exact live binding proof.
+func (s *Service) currentRaidInfoContextVisible(session *gameSession, state runtimeRaidState) bool {
+	if s == nil || s.options.currentClientVersion != "official-24.9" || !state.CurrentLayout || session == nil || session.channel.ID <= 0 || session.channel.ID > 255 {
+		return false
+	}
+	route, supported := currentRaidRouteForChannel(int(session.channel.Type))
+	serverID := s.channelAdvertiseID()
+	// 02024200 also checks the key's channel byte before reading NOTI591.
+	return supported && route == state.RouteOrRaidType && serverID >= 0 && serverID <= 255 && byte(state.RaidKey>>24) == byte(serverID) && byte(state.RaidKey>>16) == byte(session.channel.ID)
+}
+
+func (s *Service) handleOnlineModifyRaidInfo(session *gameSession, typ uint16, body []byte) error {
+	if s.options.currentClientVersion == "official-24.9" {
+		return s.handleCurrentModifyRaid(session, typ, body)
+	}
+	req, err := raid.DecodeModifyRaidInfoRequest(body)
+	if err != nil {
+		s.logGameEvent(session, "game-raid-modify-body-invalid", "type", typ, "body_len", len(body), "error", err)
+		return s.sendRaidCommandFailure(session, typ)
+	}
+	sourceID := selectedCharacterID(session)
+	state, ok := s.modifyRuntimeRaidInfo(sourceID, req)
+	if !ok {
+		return s.sendRaidCommandFailure(session, typ)
+	}
+	if err := s.sendGameUpperRawClassCodec(session, typ, []byte{1}, dnfproto.DefaultChannelClassification, true); err != nil {
+		return err
+	}
+	return s.broadcastRuntimeRaidRefresh(state)
+}
+
+func (s *Service) handleOnlineLeaveRaid(session *gameSession, typ uint16, body []byte) error {
+	req, err := raid.DecodeLeaveRaidRequest(body)
+	if err != nil {
+		s.logGameEvent(session, "game-raid-leave-body-invalid", "type", typ, "body_len", len(body), "error", err)
+		return s.sendRaidCommandFailure(session, typ)
+	}
+	sourceID := selectedCharacterID(session)
+	if s.options.currentClientVersion == "official-24.9" && req.RaidOrMemberKey != 0 && req.RaidOrMemberKey != sourceID {
+		return s.handleCurrentRaidMemberKick(session, typ, req.RaidOrMemberKey)
+	}
+	wasAntonWaiting := s.currentAntonWaitingAreaPresence(session)
+	state, removed, disbanded := s.removeRuntimeRaidMember(sourceID)
+	if !removed {
+		return s.sendRaidCommandFailure(session, typ)
+	}
+	forcedExit := disbanded && s.options.currentClientVersion != "official-24.9"
+	return s.finishOnlineRaidDeparture(session, typ, state, disbanded, wasAntonWaiting, forcedExit)
+}
+
+// The departure notification belongs to the removed session. In particular,
+// ACK665 clears the receiver's own raid UI even when it requested another UID.
+func (s *Service) finishOnlineRaidDeparture(session *gameSession, typ uint16, state runtimeRaidState, disbanded, wasAntonWaiting, forcedExit bool) error {
+	sourceID := selectedCharacterID(session)
+	var errs []error
+	var partyExit runtimePartyRaidExitProjection
+	if s.options.currentClientVersion == "official-24.9" {
+		var partyErr error
+		partyExit, partyErr = s.leaveRuntimePartyForRaidExit(session)
+		if partyErr != nil {
+			errs = append(errs, partyErr)
+		}
+	}
+	// In the current ACK665 reader the flag means forced removal (B6C7),
+	// not an empty directory object. Its ordinary branch still executes
+	// 01A64B80 and clears both the own-raid key and cached object pointer.
+	if err := s.sendGameUpperRawClassCodec(session, typ, raid.BuildLeaveRaidResultBody(forcedExit), dnfproto.DefaultChannelClassification, true); err != nil {
+		errs = append(errs, err)
+	}
+	if s.options.currentClientVersion != "official-24.9" {
+		storeRuntimePartyState(session, alignedcmd.PartyState{})
+		if err := s.sendRuntimePartyMemberRemoved(session, sourceID, alignedcmd.PartyState{}); err != nil {
+			errs = append(errs, err)
+		}
+	} else {
+		if partyExit.changed {
+			if err := s.sendRuntimePartyMemberRemoved(session, sourceID, alignedcmd.PartyState{}); err != nil {
+				errs = append(errs, err)
+			}
+			if err := s.broadcastRuntimePartyRaidExit(partyExit, sourceID, session); err != nil {
+				errs = append(errs, err)
+			}
+		}
+	}
+	if wasAntonWaiting {
+		if err := s.returnCurrentAntonMemberToGate(session); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if disbanded {
+		return errors.Join(errs...)
+	}
+	for _, member := range state.Members {
+		if latest, found := s.runtimeRaidForMember(member.CharID); found {
+			state = latest
+			break
+		}
+	}
+	// The waiting UI compares metadata.Leader against the local UID; the
+	// roster's leader flag alone cannot enable the successor's controls.
+	if s.options.currentClientVersion == "official-24.9" && state.CurrentLayout {
+		for _, member := range state.Members {
+			peer, online := s.onlineGameSession(member.CharID)
+			if !online || !s.currentRaidAdmissionVisible(peer, state) {
+				continue
+			}
+			if err := s.sendRuntimeRaidMetadata(peer, state, 2); err != nil {
+				s.failRuntimeRaidRecipient(peer, "leave_metadata", err)
+			}
+		}
+	}
+	if err := s.broadcastRuntimeRaidRefresh(state); err != nil {
+		errs = append(errs, err)
+	}
+	if state.Battle != nil {
+		if _, hadParticipation := state.Battle.Participation[sourceID]; hadParticipation {
+			s.queueCurrentRaidDungeonProgress(state)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func (s *Service) handleOnlineStartRaid(session *gameSession, typ uint16, body []byte) error {
+	if s.options.currentClientVersion == "official-24.9" && !s.currentRaidAuthenticated(session) {
+		return s.sendRaidCommandFailure(session, typ)
+	}
+	if err := raid.DecodeStartRaidRequest(body); err != nil {
+		s.logGameEvent(session, "game-raid-start-body-invalid", "type", typ, "body_len", len(body), "error", err)
+		return s.sendRaidCommandFailure(session, typ)
+	}
+	started := time.Now()
+	previous := started
+	markStage := func(stage string) {
+		now := time.Now()
+		s.logInfo("dnfbridge raid start stage", "conn_id", session.connID, "channel_id", session.channel.ID, "stage", stage,
+			"duration_ms", now.Sub(previous).Milliseconds(), "total_ms", now.Sub(started).Milliseconds())
+		previous = now
+	}
+	sourceID := selectedCharacterID(session)
+	state, ok, err := s.startRuntimeRaidWithEntryCost(session)
+	markStage("prepare_and_admission")
+	if err != nil {
+		s.logGameEvent(session, "game-raid-start-rejected", "source_char_id", sourceID, "error", err)
+	}
+	if !ok {
+		return s.sendRaidStartRejection(session, typ, err)
+	}
+	if err := s.sendGameUpperRawClassCodec(session, typ, []byte{1}, dnfproto.DefaultChannelClassification, true); err != nil {
+		return err
+	}
+	if s.options.currentClientVersion == "official-24.9" {
+		for _, member := range state.Members {
+			if peer, found := s.onlineGameSession(member.CharID); found {
+				if err := s.sendRuntimeRaidMetadata(peer, state, 2); err != nil {
+					s.failRuntimeRaidRecipient(peer, "start_metadata", err)
+				}
+			}
+		}
+	}
+	markStage("metadata")
+	if err := s.broadcastRuntimeRaidStartRefresh(state); err != nil {
+		return err
+	}
+	markStage("roster_and_profiles")
+	if err := s.applyRuntimeRaidParties(state); err != nil {
+		return err
+	}
+	markStage("parties")
+	if s.options.currentClientVersion == "official-24.9" {
+		for _, member := range state.Members {
+			peer, found := s.onlineGameSession(member.CharID)
+			if member.CharID == sourceID {
+				peer, found = session, true
+			}
+			if found {
+				if err := s.sendCurrentRaidBattleState(peer, state); err != nil {
+					s.failRuntimeRaidRecipient(peer, "battle_state", err)
+				}
+			}
+		}
+	}
+	markStage("battle_projection")
+	// Reuse the verified container refresh only after a successful group commit.
+	// log/off emit exactly the established success sequence without this refresh.
+	if isCurrentFiendWarChannel(session) || s.raidStartEntryCostMode() == raidStartEntryCostGuardEnforce {
+		for _, member := range state.Members {
+			peer, found := s.onlineGameSession(member.CharID)
+			if member.CharID == sourceID {
+				peer, found = session, true
+			}
+			if found {
+				if err := s.sendSelectedCurrentContainerListsRefresh(peer, "raid_entry_cost_after_commit"); err != nil {
+					s.failRuntimeRaidRecipient(peer, "entry_cost_containers", err)
+				}
+			}
+		}
+	}
+	markStage("entry_cost_containers")
+	s.logGameEvent(session, "game-raid-started",
+		"type", typ,
+		"raid_key", state.RaidKey,
+		"member_count", len(state.Members))
+	return nil
+}
+
+func (s *Service) handleOnlineRejoinRaid(session *gameSession, typ uint16, body []byte) error {
+	req, err := raid.DecodeRejoinRaidRequest(body)
+	if err != nil {
+		s.logGameEvent(session, "game-raid-rejoin-body-invalid", "type", typ, "body_len", len(body), "error", err)
+		return s.sendRaidCommandFailure(session, typ)
+	}
+	sourceID := selectedCharacterID(session)
+	var state runtimeRaidState
+	var ok bool
+	if s.options.currentClientVersion == "official-24.9" {
+		// Rejoin restores only retained membership in the current directory.
+		// Validate the snapshot before any success or peer projection; a legacy
+		// object must not admit an official client through the old append path.
+		state, ok = s.runtimeRaidForMember(sourceID)
+		if !ok || state.RaidKey != req.RaidKey || session.channel.ID < 0 || session.channel.ID > 255 || !s.currentRaidInfoVisible(session, state) {
+			return s.sendRaidCommandFailure(session, typ)
+		}
+		if b := state.Battle; b != nil && (b.ChannelID != session.channel.ID || b.ChannelType != session.channel.Type || b.MemberAccounts[sourceID] != s.accountIDForSession(session)) {
+			return s.sendRaidCommandFailure(session, typ)
+		}
+	} else {
+		state, ok = s.rejoinRuntimeRaid(req.RaidKey, sourceID)
+		if !ok {
+			return s.sendRaidCommandFailure(session, typ)
+		}
+	}
+	if err := s.sendGameUpperRawClassCodec(session, typ, []byte{1}, dnfproto.DefaultChannelClassification, true); err != nil {
+		return err
+	}
+	if err := s.broadcastRuntimeRaidRefresh(state); err != nil {
+		return err
+	}
+	if s.options.currentClientVersion == "official-24.9" && state.Started && state.Battle != nil {
+		// Metadata/map/timer restoration must not replay NOTI587's start
+		// animation or already completed death/movie instructions.
+		if err := s.sendRuntimeRaidMetadata(session, state, 2); err != nil {
+			return err
+		}
+		if err := s.sendCurrentRaidProgressProjection(session, state, false, true); err != nil {
+			return err
+		}
+		if err := s.sendCurrentAntonTerminalResult(session, state); err != nil {
+			return err
+		}
+		return s.sendCurrentAntonRewardFlowProjection(session, state)
+	}
+	return nil
+}
+
+func (s *Service) handleOnlineRaidManagerWork(session *gameSession, typ uint16, body []byte) error {
+	req, err := raid.DecodeManagerWorkRequest(body)
+	if err != nil {
+		s.logGameEvent(session, "game-raid-manager-body-invalid", "type", typ, "body_len", len(body), "error", err)
+		return nil
+	}
+	// All three native fields are u32. Validate before narrowing so an
+	// out-of-range member or group cannot alias a valid manager request.
+	if req.MemberCharKey == 0 || req.MemberCharKey > 0xffff || req.TargetGroup > runtimeRaidMaxGroups ||
+		(req.TargetGroup == 0 && req.ActionOrMode != 0) {
+		return nil
+	}
+	sourceID := selectedCharacterID(session)
+	state, ok, projectionChanged := s.moveRuntimeRaidMember(sourceID, uint16(req.MemberCharKey), byte(req.TargetGroup))
+	if !ok {
+		s.logGameEvent(session, "game-raid-manager-rejected",
+			"type", typ,
+			"source_char_id", sourceID,
+			"member_char_id", req.MemberCharKey,
+			"target_group", req.TargetGroup)
+		return nil
+	}
+	// S2C669 is DoNothing. Publish roster first, then only the changed
+	// live participation projection; no phase-start/reward side effects.
+	if err := s.broadcastRuntimeRaidRoster(state); err != nil {
+		return err
+	}
+	if projectionChanged {
+		s.queueCurrentRaidRosterProgress(state)
+	}
+	return nil
+}
+
+func (s *Service) handleOnlineRaidMemberChangeState(session *gameSession, typ uint16, body []byte) error {
+	req, err := raid.DecodeMemberChangeStateRequest(body)
+	if err != nil {
+		s.logGameEvent(session, "game-raid-member-state-body-invalid", "type", typ, "body_len", len(body), "error", err)
+		return nil
+	}
+	sourceID := selectedCharacterID(session)
+	state, ok := s.changeRuntimeRaidMemberState(sourceID, normalizeRuntimeRaidMemberState(req.State))
+	if !ok {
+		s.logGameEvent(session, "game-raid-member-state-ignored",
+			"type", typ,
+			"source_char_id", sourceID,
+			"state", req.State)
+		return nil
+	}
+	// MCP/IDA 证据显示 823 是客户端成员状态变化；可见同步走 0x24F 成员名单刷新。
+	// A status notification changes no actor identity or appearance. Replaying
+	// every member's mode8 here rebuilds profiles during combat and can wait on
+	// dungeon locks for the entire shared preparation budget.
+	return s.broadcastRuntimeRaidRoster(state)
+}
+
+func normalizeRuntimeRaidMemberState(state byte) byte {
+	if state == 0 {
+		return 0
+	}
+	return 1
+}
+
+func (s *Service) createRuntimeRaid(session *gameSession, sourceID uint16, req raid.InfoRequest) runtimeRaidState {
+	s.raidMu.Lock()
+	defer s.raidMu.Unlock()
+	s.ensureRuntimeRaidMapsLocked()
+	s.removeRuntimeRaidMemberLocked(sourceID)
+	key := s.nextRuntimeRaidKeyLocked(session, sourceID)
+	state := runtimeRaidState{
+		RaidKey:         key,
+		LeaderID:        sourceID,
+		RouteOrRaidType: req.RouteOrRaidType,
+		NameBytes:       append([]byte(nil), req.NameBytes...),
+		TailFlag:        req.TailFlag,
+	}
+	state.Members = s.initialRuntimeRaidMembersLocked(session, sourceID)
+	s.raids[key] = &state
+	return cloneRuntimeRaidState(state)
+}
+
+func (s *Service) modifyRuntimeRaidInfo(sourceID uint16, req raid.InfoRequest) (runtimeRaidState, bool) {
+	s.raidMu.Lock()
+	defer s.raidMu.Unlock()
+	state := s.runtimeRaidByMemberLocked(sourceID)
+	if state == nil || state.LeaderID != sourceID {
+		return runtimeRaidState{}, false
+	}
+	state.RouteOrRaidType = req.RouteOrRaidType
+	state.NameBytes = append(state.NameBytes[:0], req.NameBytes...)
+	state.TailFlag = req.TailFlag
+	return cloneRuntimeRaidState(*state), true
+}
+
+func (s *Service) removeRuntimeRaidMember(sourceID uint16) (runtimeRaidState, bool, bool) {
+	s.raidMu.Lock()
+	state, removed, disbanded := s.removeRuntimeRaidMemberLocked(sourceID)
+	var snapshot runtimeRaidState
+	if state != nil {
+		snapshot = cloneRuntimeRaidState(*state)
+	}
+	var others []onlinePlayerInfo
+	if removed && s.onlinePlayers != nil {
+		if p, found := s.onlinePlayers.PlayerForCharacter(sourceID); found && p.Instance != 0 && s.currentAntonWaitingArea(p.TownID, p.AreaID) {
+			_, others = s.onlinePlayers.LeaveArea(sourceID)
+		}
+	}
+	s.raidMu.Unlock()
+	if len(others) > 0 {
+		s.broadcastTownPlayerLeave(sourceID, others)
+	}
+	return snapshot, removed, disbanded
+}
+
+// runtimeRaidForMember 只读地取该成员所在的攻坚队快照。
+func (s *Service) runtimeRaidForMember(sourceID uint16) (runtimeRaidState, bool) {
+	if sourceID == 0 {
+		return runtimeRaidState{}, false
+	}
+	s.raidMu.Lock()
+	defer s.raidMu.Unlock()
+	state := s.runtimeRaidByMemberLocked(sourceID)
+	if state == nil || len(state.Members) == 0 {
+		return runtimeRaidState{}, false
+	}
+	return cloneRuntimeRaidState(*state), true
+}
+
+func (s *Service) startRuntimeRaidWithEntryCost(session *gameSession) (runtimeRaidState, bool, error) {
+	sourceID := selectedCharacterID(session)
+	// This bounded repository operation must finish before membership can change.
+	// Never acquire another raid lock from the transaction callback.
+	s.raidMu.Lock()
+	defer s.raidMu.Unlock()
+	state := s.runtimeRaidByMemberLocked(sourceID)
+	if state == nil || state.LeaderID != sourceID || len(state.Members) == 0 || len(state.Members) > currentRaidMemberMaximum(*state) {
+		return runtimeRaidState{}, false, &raidStartRejection{message: "请由团长确认攻坚队人数后开始攻坚"}
+	}
+	if state.Started {
+		if !s.currentRaidAuthenticated(session) || state.Battle == nil || state.Battle.MemberAccounts[sourceID] != s.accountIDForSession(session) || state.Battle.ChannelID != session.channel.ID || state.Battle.ChannelType != session.channel.Type {
+			return runtimeRaidState{}, false, nil
+		}
+		ok, err := s.beginCurrentAntonNextPhaseLocked(state, time.Now())
+		if !ok || err != nil {
+			return runtimeRaidState{}, false, err
+		}
+		return cloneRuntimeRaidState(*state), true, nil
+	}
+	membersBefore := append([]runtimeRaidMemberState(nil), state.Members...)
+	preserveSolo := s.options.currentClientVersion == "official-24.9" && runtimeRaidKeepsUneditedSolos(*state)
+	var startProjection runtimeRaidState
+	if preserveSolo {
+		// Automatic admission seats do not request an ordinary party. Resolve
+		// actual parties and explicit recruiting placements before start changes
+		// the client projection from recruiting to active.
+		var intentErr error
+		startProjection, intentErr = s.prepareCurrentRaidStartPartyIntent(*state)
+		if intentErr != nil {
+			s.logGameEvent(session, "game-raid-start-party-intent-rejected", "raid_key", state.RaidKey, "reason", intentErr)
+			return runtimeRaidState{}, false, &raidStartRejection{message: "编队状态已变化，请重新确认队伍，每队最多4人", cause: intentErr}
+		}
+	}
+	startCommitted := false
+	defer func() {
+		if startCommitted {
+			return
+		}
+		state.Members = membersBefore
+	}()
+	if preserveSolo {
+		state.Members = append([]runtimeRaidMemberState(nil), startProjection.Members...)
+	}
+	if normalizeRuntimeRaidMemberGroups(state) {
+		s.logGameEvent(session, "game-raid-member-groups-normalized",
+			"raid_key", state.RaidKey,
+			"member_count", len(state.Members),
+			"source", "raid_start_default_group_assignment")
+	}
+	if preserveSolo {
+		for i := range state.Members {
+			state.Members[i].OrdinaryPartySolo = startProjection.Members[i].OrdinaryPartySolo
+		}
+	}
+	if runtimeRaidHasOversizedGroup(*state) {
+		return runtimeRaidState{}, false, &raidStartRejection{message: "每个队伍最多编入4人，请调整编队"}
+	}
+	seen := make(map[uint16]bool, len(state.Members))
+	for _, member := range state.Members {
+		if member.CharID == 0 {
+			return runtimeRaidState{}, false, &raidStartRejection{message: "攻坚队存在无效角色，请重新确认成员名单"}
+		}
+		if seen[member.CharID] {
+			return runtimeRaidState{}, false, &raidStartRejection{message: "攻坚队成员重复，请重新确认成员名单", members: []uint16{member.CharID}}
+		}
+		if member.GroupIndex > currentRaidGroupMaximum(*state) {
+			return runtimeRaidState{}, false, &raidStartRejection{message: "队员组别无效，请重新调整编队", members: []uint16{member.CharID}}
+		}
+		// A retained offline seat is not a paid admission. Bind/restore or
+		// expiry must resolve it before the current aggregate is frozen.
+		if seat, reserved := s.currentRaidDisconnects[member.CharID]; state.CurrentLayout && reserved && seat.Raid == state {
+			return runtimeRaidState{}, false, &raidStartRejection{message: "队员尚未重新连接，请等待队员归队", members: []uint16{member.CharID}}
+		}
+		seen[member.CharID] = true
+	}
+	battle, err := s.prepareCurrentRaidBattle(session, cloneRuntimeRaidState(*state))
+	if err != nil {
+		return runtimeRaidState{}, false, err
+	}
+	waitingScope, err := s.prepareCurrentRaidWaitingBattleScope(session, *state, battle)
+	if err != nil {
+		return runtimeRaidState{}, false, err
+	}
+	if err := s.onlinePlayers.requireRaidStartWaitingArea(waitingScope, ""); err != nil {
+		return runtimeRaidState{}, false, err
+	}
+	allowed := false
+	if battle != nil && battle.FiendWar != nil {
+		err = s.consumeCurrentFiendWarEntry(session, *state, battle)
+		allowed = err == nil
+	} else {
+		entryState := cloneRuntimeRaidState(*state)
+		entryState.Battle = battle
+		allowed, err = s.guardRaidStartEntryCost(session, entryState)
+	}
+	if err != nil || !allowed {
+		return runtimeRaidState{}, false, err
+	}
+	// Normal current-client starts retain the resolved solo/explicit-placement
+	// intent. Other layouts keep their historical reset after all admission gates.
+	if !preserveSolo {
+		resetRuntimeRaidSoloProjection(state)
+	}
+	state.Started = true
+	state.Battle = battle
+	if battle != nil {
+		s.onlinePlayers.bindRaidWaitingBattleInstance(waitingScope)
+	}
+	startCommitted = true
+	return cloneRuntimeRaidState(*state), true, nil
+}
+
+func (s *Service) rejoinRuntimeRaid(raidKey uint32, sourceID uint16) (runtimeRaidState, bool) {
+	if sourceID == 0 {
+		return runtimeRaidState{}, false
+	}
+	s.raidMu.Lock()
+	defer s.raidMu.Unlock()
+	state := s.raids[raidKey]
+	if state == nil {
+		return runtimeRaidState{}, false
+	}
+	if runtimeRaidMemberIndex(*state, sourceID) < 0 {
+		// Current rejoin restores an existing member; it is never an alternate
+		// way to bypass a leader's approval of a new application.
+		if state.CurrentLayout {
+			return runtimeRaidState{}, false
+		}
+		if len(state.Members) >= currentRaidMemberMaximum(*state) {
+			return runtimeRaidState{}, false
+		}
+		state.Members = append(state.Members, s.newRuntimeRaidMemberLocked(sourceID, runtimeRaidDefaultGroup, nextRuntimeRaidSlot(*state, runtimeRaidDefaultGroup)))
+	}
+	return cloneRuntimeRaidState(*state), true
+}
+
+func (s *Service) changeRuntimeRaidMemberState(sourceID uint16, userState byte) (runtimeRaidState, bool) {
+	if sourceID == 0 {
+		return runtimeRaidState{}, false
+	}
+	s.raidMu.Lock()
+	defer s.raidMu.Unlock()
+	state := s.runtimeRaidByMemberLocked(sourceID)
+	if state == nil {
+		return runtimeRaidState{}, false
+	}
+	index := runtimeRaidMemberIndex(*state, sourceID)
+	if index < 0 {
+		return runtimeRaidState{}, false
+	}
+	state.Members[index].UserState = userState
+	return cloneRuntimeRaidState(*state), true
+}
+
+func (s *Service) moveRuntimeRaidMember(sourceID uint16, memberID uint16, targetGroup byte) (runtimeRaidState, bool, bool) {
+	if targetGroup > runtimeRaidMaxGroups {
+		return runtimeRaidState{}, false, false
+	}
+	s.raidMu.Lock()
+	defer s.raidMu.Unlock()
+	state := s.runtimeRaidByMemberLocked(sourceID)
+	if state == nil || state.LeaderID != sourceID {
+		return runtimeRaidState{}, false, false
+	}
+	index := runtimeRaidMemberIndex(*state, memberID)
+	if index < 0 {
+		return runtimeRaidState{}, false, false
+	}
+	// V215's RemovePartyBtn/group selector sends {0, member, 0} for
+	// every member of the selected normal raid group. Zero clears only the
+	// planned placement; ordinary-party and frozen battle owners stay intact.
+	if targetGroup == 0 && (!state.CurrentLayout || state.RouteOrRaidType > 1) {
+		return runtimeRaidState{}, false, false
+	}
+	if targetGroup > currentRaidGroupMaximum(*state) {
+		return runtimeRaidState{}, false, false
+	}
+	if state.RouteOrRaidType == 2 && state.Started {
+		return runtimeRaidState{}, false, false
+	}
+	if targetGroup != 0 && state.RouteOrRaidType != 2 && runtimeRaidGroupAssignedCount(*state, targetGroup, memberID) >= runtimeRaidGroupSize {
+		return runtimeRaidState{}, false, false
+	}
+	if state.RouteOrRaidType == 2 {
+		for i := range state.Members {
+			if state.Members[i].CharID != memberID && state.Members[i].GroupIndex == targetGroup {
+				state.Members[i].GroupIndex = 0
+				state.Members[i].SlotOrder = 0
+			}
+		}
+	}
+	groupChanged := state.Members[index].GroupIndex != targetGroup
+	state.Members[index].GroupIndex = targetGroup
+	if targetGroup == 0 {
+		state.Members[index].SlotOrder = 0
+		state.Members[index].OrdinaryPartySolo = true
+		state.Members[index].RecruitingPlacementExplicit = false
+	} else {
+		state.Members[index].SlotOrder = nextRuntimeRaidSlotExcluding(*state, targetGroup, memberID)
+		state.Members[index].OrdinaryPartySolo = false
+		if !state.Started && state.CurrentLayout && state.RouteOrRaidType <= 1 {
+			state.Members[index].RecruitingPlacementExplicit = true
+		}
+	}
+	runtimeRaidSortMembers(state.Members)
+	projectionChanged := false
+	if s.options.currentClientVersion == "official-24.9" && groupChanged && state.Started && state.Battle != nil && !state.Battle.TimedOut {
+		entry, occupied := state.Battle.Participation[memberID]
+		if occupied && entry.RunID != "" && entry.Phase == state.Battle.Phase && state.Battle.MemberAccounts[memberID] != "" && (state.Battle.Anton == nil || entry.Attempt == state.Battle.Anton.Epoch()) {
+			state.Battle.ProgressVersion++
+			projectionChanged = true
+		}
+	}
+	return cloneRuntimeRaidState(*state), true, projectionChanged
+}
+
+func (s *Service) broadcastRuntimeRaidRefresh(state runtimeRaidState) error {
+	return s.broadcastRuntimeRaidProjection(state, true)
+}
+
+func (s *Service) broadcastRuntimeRaidStartRefresh(state runtimeRaidState) error {
+	if s.options.currentClientVersion != "official-24.9" {
+		return s.broadcastRuntimeRaidRefresh(state)
+	}
+	// All members were admitted before start. Refresh category1 properties,
+	// placement and committed ticket counts, not every peer's full appearance.
+	// Ordinary-party formation retains its own required actor priming below.
+	return s.broadcastRuntimeRaidProjectionWithAppearance(state, true, 0, false)
+}
+
+func (s *Service) broadcastRuntimeRaidRoster(state runtimeRaidState) error {
+	return s.broadcastRuntimeRaidProjection(state, false)
+}
+
+func (s *Service) broadcastRuntimeRaidProjection(state runtimeRaidState, includeProfiles bool) error {
+	return s.broadcastRuntimeRaidProjectionForJoin(state, includeProfiles, 0)
+}
+
+func (s *Service) broadcastRuntimeRaidJoinRefresh(state runtimeRaidState, joined uint16) error {
+	return s.broadcastRuntimeRaidProjectionForJoin(state, true, joined)
+}
+
+func (s *Service) broadcastRuntimeRaidProjectionForJoin(state runtimeRaidState, includeProfiles bool, joined uint16) error {
+	return s.broadcastRuntimeRaidProjectionWithAppearance(state, includeProfiles, joined, true)
+}
+
+func (s *Service) broadcastRuntimeRaidProjectionWithAppearance(state runtimeRaidState, includeProfiles bool, joined uint16, includeAppearance bool) error {
+	body, err := s.buildRuntimeRaidRosterBody(state)
+	if err != nil {
+		return err
+	}
+	profileCtx, cancelProfiles := context.WithTimeout(context.Background(), createWriteTimeout)
+	defer cancelProfiles()
+	profiles := newCurrentRaidProfileBatch(s, profileCtx)
+	// Ownership already read for the profiles belongs to this same broadcast.
+	// Inventory remains a fresh committed read; never retain either across calls.
+	admission := &currentRaidAdmissionBatch{ctx: profiles.ctx}
+	for _, member := range state.Members {
+		session, ok := s.onlineGameSession(member.CharID)
+		if !ok {
+			continue
+		}
+		if includeProfiles {
+			var actors map[uint16]bool
+			if !includeAppearance {
+				actors = map[uint16]bool{}
+			} else if joined != 0 && member.CharID != joined {
+				actors = map[uint16]bool{joined: true}
+			}
+			if err := s.sendCurrentRuntimeRaidProfilesWithBatchForActors(session, state, profiles, actors); err != nil {
+				s.failRuntimeRaidRecipient(session, "profiles", err)
+				continue
+			}
+		}
+		if err := s.sendGameUpperRawClassCodec(session, raid.RaidMemberRefreshMsgID, body, 0, true); err != nil {
+			s.failRuntimeRaidRecipient(session, "roster", err)
+			continue
+		}
+		if includeProfiles {
+			if err := s.sendCurrentRuntimeRaidEntryCostWithBatch(session, state, admission); err != nil {
+				s.failRuntimeRaidRecipient(session, "entry_cost", err)
+			}
+		}
+	}
+	return nil
+}
+
+func (s *Service) applyRuntimeRaidParties(state runtimeRaidState) error {
+	// A manual Anton phase-two start reuses the start command, but its raid
+	// seats are not authority to recreate ordinary parties formed during
+	// phase one. Keep their IDs, slots and live UDP transports intact.
+	if b := state.Battle; s.options.currentClientVersion == "official-24.9" &&
+		b != nil && b.Mode == 1 && !b.Single && b.Phase > 0 {
+		return nil
+	}
+	// FiendWar's 1..8 placements are personal raid seats, not ordinary party
+	// rows. Its only party is the temporary combat party created from the
+	// confirmed source-map encounter roster. Applying this helper at raid start
+	// would form one self-only ordinary party per seat (route 2 has eight
+	// single-member groups), causing the local HP bar before anyone enters.
+	if state.Battle != nil && state.Battle.FiendWar != nil {
+		return nil
+	}
+	groupStates := make([]alignedcmd.PartyState, 0)
+	preserved := make(map[int]bool)
+	for _, group := range runtimeRaidPartyGroups(state) {
+		if len(group) == 0 {
+			continue
+		}
+		desired := runtimeRaidGroupPartyState(state, group)
+		partyState, kept := s.matchPreformedRuntimeRaidParty(state, desired)
+		replaced := kept
+		if !kept {
+			partyState, replaced = s.replaceManagedRuntimeParty(desired)
+		}
+		preserved[partyState.PartyID] = kept
+		if !replaced {
+			return fmt.Errorf("raid party group could not be applied through runtime party manager")
+		}
+		groupStates = append(groupStates, partyState)
+	}
+	// Any prior ordinary party that still has non-raid survivors was changed by
+	// the central manager while group members moved. Refresh its projections
+	// from manager snapshots before writing any client-facing raid roster.
+	s.publishAllManagedRuntimeParties()
+	for _, partyState := range groupStates {
+		for _, member := range runtimePartyMembers(partyState) {
+			session, ok := s.onlineGameSession(member.UserID)
+			if !ok {
+				continue
+			}
+			var err error
+			if preserved[partyState.PartyID] {
+				err = s.sendRuntimePartyRosterRefresh(session, partyState, "raid_start_existing_party")
+			} else {
+				err = s.sendRuntimePartySnapshot(session, partyState)
+			}
+			if err != nil {
+				s.failRuntimeRaidRecipient(session, "party_snapshot", err)
+			}
+		}
+	}
+	return nil
+}
+
+func (s *Service) initialRuntimeRaidMembersLocked(session *gameSession, sourceID uint16) []runtimeRaidMemberState {
+	members := []runtimeRaidMemberState{s.newRuntimeRaidMemberLocked(sourceID, runtimeRaidDefaultGroup, 0)}
+	state := runtimePartyStateSnapshot(session)
+	for _, member := range runtimePartyMembers(state) {
+		if member.UserID == 0 || member.UserID == sourceID || len(members) >= raid.MaxAttackPartyMembers {
+			continue
+		}
+		members = append(members, s.newRuntimeRaidMemberLocked(member.UserID, runtimeRaidDefaultGroup, byte(len(members)%runtimeRaidGroupSize)))
+	}
+	return members
+}
+
+func (s *Service) newRuntimeRaidMemberLocked(charID uint16, group byte, slot byte) runtimeRaidMemberState {
+	member := runtimeRaidMemberState{
+		CharID:     charID,
+		Name:       s.runtimeRaidCharacterName(charID),
+		GroupIndex: group,
+		SlotOrder:  slot,
+		UserState:  1,
+		HPPercent:  100,
+		MPPercent:  100,
+	}
+	if repos, ok := s.repositoryGroup(); ok && repos.Character != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), createWriteTimeout)
+		defer cancel()
+		if character, found, err := repos.Character.Load(ctx, strconv.Itoa(int(charID))); err == nil && found {
+			member.Name = character.Name
+			member.Job = byte(numericCharacterStat(character.Job))
+			member.GrowType = characterGrowTypeByte(character)
+			member.Level = uint32(rosterLevel(character))
+		}
+	}
+	return member
+}
+
+func (s *Service) runtimeRaidCharacterName(charID uint16) string {
+	repos, ok := s.repositoryGroup()
+	if ok && repos.Character != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), createWriteTimeout)
+		defer cancel()
+		if record, found, err := repos.Character.Load(ctx, strconv.Itoa(int(charID))); err == nil && found && record.Name != "" {
+			return record.Name
+		}
+	}
+	return csharpSelectCharacterName(charID)
+}
+
+func (s *Service) sendRaidCommandFailure(session *gameSession, typ uint16) error {
+	return s.sendGameUpperRawClassCodec(session, typ, []byte{0, runtimeRaidFailureCode}, dnfproto.DefaultChannelClassification, true)
+}
+
+func (s *Service) ensureRuntimeRaidMapsLocked() {
+	if s.raids == nil {
+		s.raids = make(map[uint32]*runtimeRaidState)
+	}
+}
+
+func (s *Service) nextRuntimeRaidKeyLocked(session *gameSession, sourceID uint16) uint32 {
+	channelID := uint32(0)
+	if session != nil {
+		channelID = uint32(uint16(session.channel.ID))
+	}
+	prefix := channelID << 16
+	if s.options.currentClientVersion == "official-24.9" {
+		// Current 02024200 checks bits16..23 against global56A1E80
+		// (CHANNELINFO field8: selected channel), and bits24..31 against
+		// global56A1E74 (field7: advertised server) before parsing 591.
+		prefix = channelID<<16 | uint32(s.channelAdvertiseID())<<24
+	}
+	base := prefix | uint32(sourceID)
+	if base != 0 {
+		if _, exists := s.raids[base]; !exists {
+			return base
+		}
+	}
+	for {
+		s.nextRaidSeq++
+		key := prefix | uint32(uint16(s.nextRaidSeq))
+		if key == 0 {
+			continue
+		}
+		if _, exists := s.raids[key]; !exists {
+			return key
+		}
+	}
+}
+
+func (s *Service) runtimeRaidByMemberLocked(charID uint16) *runtimeRaidState {
+	if charID == 0 {
+		return nil
+	}
+	for _, state := range s.raids {
+		if runtimeRaidMemberIndex(*state, charID) >= 0 {
+			return state
+		}
+	}
+	return nil
+}
+
+func (s *Service) removeRuntimeRaidMemberLocked(charID uint16) (*runtimeRaidState, bool, bool) {
+	state := s.runtimeRaidByMemberLocked(charID)
+	if state == nil {
+		return nil, false, false
+	}
+	next := state.Members[:0]
+	removed := false
+	for _, member := range state.Members {
+		if member.CharID == charID {
+			removed = true
+			continue
+		}
+		next = append(next, member)
+	}
+	if !removed {
+		return state, false, false
+	}
+	if b := state.Battle; b != nil && b.FiendWar != nil {
+		f := b.FiendWar.Clone()
+		delete(f.MemberAreas, charID)
+		delete(f.RecoveryUntil, charID)
+		delete(f.GroupAreas, b.MemberGroups[charID])
+		b.FiendWar = f
+		b.ProgressVersion++
+	}
+	state.Members = next
+	if len(state.Members) == 0 {
+		delete(s.raids, state.RaidKey)
+		return nil, true, true
+	}
+	// The roster mutation is a projection revision. Subscribers queued after
+	// this commit can now remove the departed member's 584 row from their own
+	// cached previous snapshot.
+	if state.Battle != nil {
+		state.Battle.ProgressVersion++
+	}
+	if state.LeaderID == charID || runtimeRaidMemberIndex(*state, state.LeaderID) < 0 {
+		state.LeaderID = state.Members[0].CharID
+	}
+	return state, true, false
+}
+
+func runtimeRaidMemberRefresh(state runtimeRaidState) raid.MemberRefresh {
+	members := append([]runtimeRaidMemberState(nil), state.Members...)
+	runtimeRaidSortMembers(members)
+	out := raid.MemberRefresh{RaidKey: state.RaidKey, Members: make([]raid.MemberRecord, 0, len(members))}
+	for _, member := range members {
+		out.Members = append(out.Members, raid.MemberRecord{
+			CharKey:           member.CharID,
+			Field4:            member.UserState,
+			Name:              member.Name,
+			Field40:           member.Job,
+			Field44:           member.GrowType,
+			GroupIndex:        member.GroupIndex,
+			SlotOrder:         member.SlotOrder,
+			Field48:           member.Level,
+			Field52:           0,
+			Field53:           0,
+			Field56:           0,
+			Field60:           0,
+			Field64:           0,
+			Field66BoolSource: boolUint32(member.CharID == state.LeaderID),
+		})
+	}
+	return out
+}
+
+func runtimeRaidPartyGroups(state runtimeRaidState) [][]runtimeRaidMemberState {
+	members := append([]runtimeRaidMemberState(nil), state.Members...)
+	runtimeRaidSortMembers(members)
+	groups := make([][]runtimeRaidMemberState, 0, runtimeRaidMaxGroups)
+	byGroup := make(map[byte][]runtimeRaidMemberState)
+	for _, member := range members {
+		if runtimeRaidKeepsUneditedSolos(state) && member.OrdinaryPartySolo {
+			continue
+		}
+		group := member.GroupIndex
+		if group == 0 {
+			group = runtimeRaidDefaultGroup
+		}
+		member.GroupIndex = group
+		byGroup[group] = append(byGroup[group], member)
+	}
+	keys := make([]int, 0, len(byGroup))
+	for group := range byGroup {
+		keys = append(keys, int(group))
+	}
+	sort.Ints(keys)
+	for _, key := range keys {
+		groups = append(groups, byGroup[byte(key)])
+	}
+	return groups
+}
+
+func runtimeRaidKeepsUneditedSolos(state runtimeRaidState) bool {
+	return state.CurrentLayout && state.RouteOrRaidType <= 1 && state.CurrentUIFlags[0] == 0
+}
+
+func runtimeRaidMemberReservesOrdinaryGroup(state runtimeRaidState, member runtimeRaidMemberState) bool {
+	return !runtimeRaidKeepsUneditedSolos(state) || !member.OrdinaryPartySolo || member.RecruitingPlacementExplicit
+}
+
+// GroupIndex 0 is normalized only for admission's canonical seat identity.
+// A concrete seat alone never requests an ordinary party: normal current-client
+// starts independently retain the resolved solo/explicit-placement intent.
+func normalizedRuntimeRaidGroup(group byte) byte {
+	if group == 0 {
+		return runtimeRaidDefaultGroup
+	}
+	return group
+}
+
+func runtimeRaidGroupAssignedCount(state runtimeRaidState, group byte, exclude uint16) int {
+	count := 0
+	for _, member := range state.Members {
+		if member.CharID == exclude {
+			continue
+		}
+		if !runtimeRaidMemberReservesOrdinaryGroup(state, member) {
+			continue
+		}
+		if normalizedRuntimeRaidGroup(member.GroupIndex) == group {
+			count++
+		}
+	}
+	return count
+}
+
+func nextRuntimeRaidMemberPlacement(state runtimeRaidState, exclude uint16) (byte, byte, bool) {
+	maxGroup, groupCapacity := runtimeRaidMemberPlacementLimits(state)
+	for group := byte(1); group <= maxGroup; group++ {
+		if runtimeRaidGroupAssignedCount(state, group, exclude) >= groupCapacity {
+			continue
+		}
+		used := make(map[byte]bool)
+		for _, member := range state.Members {
+			if member.CharID == exclude || member.GroupIndex == 0 || normalizedRuntimeRaidGroup(member.GroupIndex) != group {
+				continue
+			}
+			used[member.SlotOrder] = true
+		}
+		for slot := byte(0); int(slot) < groupCapacity; slot++ {
+			if !used[slot] {
+				return group, slot, true
+			}
+		}
+	}
+	return 0, 0, false
+}
+
+func appendRuntimeRaidMemberWithLegalGroup(state *runtimeRaidState, member runtimeRaidMemberState) (runtimeRaidMemberState, bool) {
+	if state == nil {
+		return runtimeRaidMemberState{}, false
+	}
+	group, slot, ok := nextRuntimeRaidMemberPlacement(*state, member.CharID)
+	if !ok {
+		return runtimeRaidMemberState{}, false
+	}
+	member.GroupIndex, member.SlotOrder = group, slot
+	state.Members = append(state.Members, member)
+	return member, true
+}
+
+func normalizeRuntimeRaidMemberGroups(state *runtimeRaidState) bool {
+	if state == nil {
+		return false
+	}
+	changed := false
+	for i := range state.Members {
+		if state.Members[i].OrdinaryPartySolo {
+			state.Members[i].OrdinaryPartySolo = false
+			changed = true
+		}
+		if state.Members[i].GroupIndex != 0 {
+			continue
+		}
+		group, slot, ok := nextRuntimeRaidMemberPlacement(*state, state.Members[i].CharID)
+		if !ok {
+			continue
+		}
+		state.Members[i].GroupIndex, state.Members[i].SlotOrder = group, slot
+		changed = true
+	}
+	return changed
+}
+func runtimeRaidMemberPlacementLimits(state runtimeRaidState) (byte, int) {
+	// Route 2 uses eight single-member groups; Anton/Luke use four slots.
+	if state.RouteOrRaidType == 2 {
+		return 8, 1
+	}
+	return currentRaidGroupMaximum(state), runtimeRaidGroupSize
+}
+
+// planRuntimeRaidGroupSynchronization computes the complete live-member
+// placement on a copy. It never changes Battle.MemberGroups, which is the
+// reward-frozen admission set. Raw group 0 is a real pending placement: it is
+// materialized in the anchor group, including when the normalized group already
+// matches, and occupies capacity while being planned.
+func planRuntimeRaidGroupSynchronization(raid runtimeRaidState, party alignedcmd.PartyState, newlyFormed ...bool) ([]runtimeRaidMemberState, bool) {
+	if raid.Started && raid.CurrentLayout && raid.RouteOrRaidType <= 1 {
+		return planStartedRaidOrdinaryPartyGroup(raid, party, newlyFormed...)
+	}
+	members := runtimePartyMembers(party)
+	if party.UserID == 0 || len(members) < 2 {
+		return nil, false
+	}
+	maximum, capacity := runtimeRaidMemberPlacementLimits(raid)
+	if capacity < len(members) {
+		return nil, false
+	}
+	anchorIndex := runtimeRaidMemberIndex(raid, party.UserID)
+	if anchorIndex < 0 {
+		return nil, false
+	}
+	anchorGroup := normalizedRuntimeRaidGroup(raid.Members[anchorIndex].GroupIndex)
+	partyIDs := make(map[uint16]bool, len(members))
+	for _, member := range members {
+		partyIDs[member.UserID] = true
+	}
+	if runtimeRaidKeepsUneditedSolos(raid) && len(newlyFormed) > 0 && newlyFormed[0] && !raid.Members[anchorIndex].RecruitingPlacementExplicit {
+		anchorGroup = 0
+		for group := byte(1); group <= maximum; group++ {
+			reserved := 0
+			for _, member := range raid.Members {
+				if !partyIDs[member.CharID] && runtimeRaidMemberReservesOrdinaryGroup(raid, member) && normalizedRuntimeRaidGroup(member.GroupIndex) == group {
+					reserved++
+				}
+			}
+			if reserved == 0 {
+				anchorGroup = group
+				break
+			}
+		}
+	}
+	if anchorGroup < 1 || anchorGroup > maximum {
+		return nil, false
+	}
+	occupied := runtimeRaidGroupAssignedCount(raid, anchorGroup, 0)
+	moversToAdd := 0
+	for _, member := range members {
+		index := runtimeRaidMemberIndex(raid, member.UserID)
+		if index < 0 {
+			return nil, false
+		}
+		if normalizedRuntimeRaidGroup(raid.Members[index].GroupIndex) != anchorGroup {
+			moversToAdd++
+		}
+	}
+	if occupied+moversToAdd > capacity {
+		return nil, false
+	}
+	used := make(map[byte]bool)
+	for _, member := range raid.Members {
+		if partyIDs[member.CharID] || !runtimeRaidMemberReservesOrdinaryGroup(raid, member) || normalizedRuntimeRaidGroup(member.GroupIndex) != anchorGroup {
+			continue
+		}
+		if int(member.SlotOrder) < capacity {
+			used[member.SlotOrder] = true
+		}
+	}
+	candidate := append([]runtimeRaidMemberState(nil), raid.Members...)
+	changed := false
+	nextSlot := func() (byte, bool) {
+		for slot := byte(0); int(slot) < capacity; slot++ {
+			if !used[slot] {
+				used[slot] = true
+				return slot, true
+			}
+		}
+		return 0, false
+	}
+	for _, member := range members {
+		index := runtimeRaidMemberIndex(raid, member.UserID)
+		if index < 0 {
+			return nil, false
+		}
+		rawGroup := candidate[index].GroupIndex
+		rawSlot := candidate[index].SlotOrder
+		if candidate[index].OrdinaryPartySolo {
+			candidate[index].OrdinaryPartySolo = false
+			changed = true
+		}
+		if rawGroup == anchorGroup && int(rawSlot) < capacity && !used[rawSlot] {
+			used[rawSlot] = true
+			continue
+		}
+		slot, ok := nextSlot()
+		if !ok {
+			return nil, false
+		}
+		candidate[index].GroupIndex, candidate[index].SlotOrder = anchorGroup, slot
+		changed = true
+	}
+	if !changed {
+		return nil, false
+	}
+	return candidate, true
+}
+func currentRaidMemberActiveForPartySync(raid *runtimeRaidState, charID uint16) bool {
+	if raid == nil || raid.Battle == nil {
+		return false
+	}
+	entry, occupied := raid.Battle.Participation[charID]
+	if !occupied || entry.RunID == "" || entry.Phase != raid.Battle.Phase || raid.Battle.MemberAccounts[charID] == "" {
+		return false
+	}
+	return raid.Battle.Anton == nil || entry.Attempt == raid.Battle.Anton.Epoch()
+}
+
+// synchronizeOrdinaryPartyRaidGroups materializes the accepted ordinary party
+// as one legal raid attack group when every member belongs to the same raid.
+// The anchor keeps its explicit group; the full placement is planned on a copy
+// before any live member changes. Frozen Battle.MemberGroups and members with
+// active dungeon participation are never changed here.
+func (s *Service) synchronizeOrdinaryPartyRaidGroups(partyState alignedcmd.PartyState, source string, expected party.RuntimePartySnapshot) bool {
+	if s == nil || s.options.currentClientVersion != "official-24.9" || partyState.PartyID <= 0 || partyState.UserID == 0 {
+		return false
+	}
+	manager := s.runtimePartyManagerForService()
+	if int(expected.ID) != partyState.PartyID || expected.Leader != partyState.UserID || manager.WithSnapshot(expected, func() error { return nil }) != nil {
+		return false
+	}
+	members := runtimePartyMembers(partyState)
+	if len(members) != len(expected.Members) || len(members) < 2 {
+		return false
+	}
+	for i, member := range runtimePartyMembers(expected.StateFor(expected.Leader)) {
+		if member.UserID != members[i].UserID || member.Slot != members[i].Slot {
+			return false
+		}
+	}
+	// Party membership owns the solo marker independently of whether this
+	// party can be materialized as one raid attack group. Refresh before any
+	// group-sync eligibility check so a valid join cannot leave a stale chip.
+	soloSnapshots := s.updateCurrentRaidSoloForPartyMembers(
+		runtimePartySoloMemberIDs(alignedcmd.PartyState{}, partyState),
+		false,
+	)
+	groupBroadcasted := false
+	var committedRaidKey uint32
+	defer func() {
+		if groupBroadcasted && committedRaidKey != 0 {
+			filtered := soloSnapshots[:0]
+			for _, snapshot := range soloSnapshots {
+				if snapshot.RaidKey != committedRaidKey {
+					filtered = append(filtered, snapshot)
+				}
+			}
+			soloSnapshots = filtered
+		}
+		s.broadcastCurrentRaidSoloSnapshots(soloSnapshots, "ordinary_party_join:"+source)
+	}()
+	accounts := make(map[uint16]string, len(members))
+	for _, member := range members {
+		session, ok := s.onlineGameSession(member.UserID)
+		if !ok || session == nil {
+			return false
+		}
+		identity, current := s.boundGameSessionCharacterSnapshot(session)
+		if !current || identity.character != member.UserID || s.sessionHasActiveDungeonRuntime(session) {
+			return false
+		}
+		account := s.accountIDForSession(session)
+		if account == "" {
+			return false
+		}
+		accounts[member.UserID] = account
+	}
+	s.raidMu.Lock()
+	raid := s.runtimeRaidByMemberLocked(partyState.UserID)
+	if raid == nil {
+		s.raidMu.Unlock()
+		return false
+	}
+	for _, member := range members {
+		if s.runtimeRaidByMemberLocked(member.UserID) != raid || currentRaidMemberActiveForPartySync(raid, member.UserID) {
+			s.raidMu.Unlock()
+			return false
+		}
+		if raid.Battle != nil {
+			if frozenAccount := raid.Battle.MemberAccounts[member.UserID]; frozenAccount != "" && frozenAccount != accounts[member.UserID] {
+				s.raidMu.Unlock()
+				return false
+			}
+		}
+	}
+	planning := s.currentRaidLivePartyProjection(cloneRuntimeRaidState(*raid))
+	candidate, ok := planRuntimeRaidGroupSynchronization(planning, partyState, len(expected.Members) == 2)
+	if !ok {
+		s.raidMu.Unlock()
+		return false
+	}
+	partyMemberIDs := make(map[uint16]bool, len(members))
+	for _, member := range members {
+		partyMemberIDs[member.UserID] = true
+	}
+	for i := range candidate {
+		if !partyMemberIDs[candidate[i].CharID] {
+			// Live solo flags are planning input only for unrelated members;
+			// an ordinary-party join must not commit their presentation state.
+			candidate[i] = raid.Members[i]
+		}
+	}
+	// Keep the manager revision stable only for this short raid-state commit.
+	// An older two-member join result cannot split a newer three-member party.
+	if manager.WithSnapshot(expected, func() error {
+		raid.Members = candidate
+		return nil
+	}) != nil {
+		s.raidMu.Unlock()
+		return false
+	}
+	committedRaidKey = raid.RaidKey
+	snapshot := cloneRuntimeRaidState(*raid)
+	s.raidMu.Unlock()
+	var anchorSession *gameSession
+	if anchor, found := s.onlineGameSession(partyState.UserID); found {
+		anchorSession = anchor
+		s.logGameEvent(anchor, "game-party-raid-groups-synchronized",
+			"source", source,
+			"party_id", partyState.PartyID,
+			"raid_key", snapshot.RaidKey,
+			"anchor_group", normalizedRuntimeRaidGroup(snapshot.Members[runtimeRaidMemberIndex(snapshot, partyState.UserID)].GroupIndex),
+			"member_count", len(members))
+	}
+	err := s.broadcastRuntimeRaidRoster(snapshot)
+	groupBroadcasted = true
+	if err != nil && anchorSession != nil {
+		s.logGameEvent(anchorSession, "game-party-raid-groups-sync-broadcast-failed",
+			"source", source,
+			"raid_key", snapshot.RaidKey,
+			"error", err)
+	}
+	return true
+}
+func runtimeRaidHasOversizedGroup(state runtimeRaidState) bool {
+	counts := make(map[byte]int)
+	for _, member := range state.Members {
+		if runtimeRaidKeepsUneditedSolos(state) && member.OrdinaryPartySolo {
+			continue
+		}
+		group := member.GroupIndex
+		if group == 0 {
+			group = runtimeRaidDefaultGroup
+		}
+		counts[group]++
+		if counts[group] > currentRaidGroupCapacity(state) {
+			return true
+		}
+	}
+	return false
+}
+
+func runtimeRaidGroupPartyState(state runtimeRaidState, members []runtimeRaidMemberState) alignedcmd.PartyState {
+	leaderID := members[0].CharID
+	partyState := alignedcmd.PartyState{
+		PartyID:    int(state.RaidKey&0xffff) + int(members[0].GroupIndex)*1000,
+		IsLeader:   true,
+		UserID:     leaderID,
+		UserState:  1,
+		NameBytes:  append([]byte(nil), state.NameBytes...),
+		MaxMembers: runtimeRaidGroupSize,
+		Members:    make([]alignedcmd.PartyMemberState, 0, len(members)),
+	}
+	if len(partyState.NameBytes) == 0 {
+		partyState.NameBytes = []byte("raid")
+	}
+	for _, member := range members {
+		slot := byte(0)
+		if runtimeRaidKeepsUneditedSolos(state) {
+			slot = member.SlotOrder
+		}
+		partyState.Members = append(partyState.Members, alignedcmd.PartyMemberState{
+			UserID:    member.CharID,
+			Slot:      slot,
+			UserState: firstByte(member.UserState, 1),
+			HPPercent: firstByte(member.HPPercent, 100),
+			MPPercent: firstByte(member.MPPercent, 100),
+		})
+	}
+	return partyState
+}
+
+func runtimeRaidMemberIndex(state runtimeRaidState, charID uint16) int {
+	for i, member := range state.Members {
+		if member.CharID == charID {
+			return i
+		}
+	}
+	return -1
+}
+
+func nextRuntimeRaidSlot(state runtimeRaidState, group byte) byte {
+	return nextRuntimeRaidSlotExcluding(state, group, 0)
+}
+
+func nextRuntimeRaidSlotExcluding(state runtimeRaidState, group byte, exclude uint16) byte {
+	used := make(map[byte]bool)
+	for _, member := range state.Members {
+		if member.CharID == exclude || member.GroupIndex != group {
+			continue
+		}
+		used[member.SlotOrder] = true
+	}
+	for i := byte(0); i < runtimeRaidGroupSize; i++ {
+		if !used[i] {
+			return i
+		}
+	}
+	return runtimeRaidGroupSize - 1
+}
+
+func runtimeRaidSortMembers(members []runtimeRaidMemberState) {
+	sort.SliceStable(members, func(i, j int) bool {
+		leftGroup := raidSortGroup(members[i].GroupIndex)
+		rightGroup := raidSortGroup(members[j].GroupIndex)
+		if leftGroup != rightGroup {
+			return leftGroup < rightGroup
+		}
+		if members[i].SlotOrder != members[j].SlotOrder {
+			return members[i].SlotOrder < members[j].SlotOrder
+		}
+		return members[i].CharID < members[j].CharID
+	})
+}
+
+func raidSortGroup(group byte) int {
+	if group == 0 {
+		return 1000
+	}
+	return int(group)
+}
+
+func cloneRuntimeRaidState(state runtimeRaidState) runtimeRaidState {
+	state.NameBytes = append([]byte(nil), state.NameBytes...)
+	state.Members = append([]runtimeRaidMemberState(nil), state.Members...)
+	state.Battle = cloneRuntimeRaidBattle(state.Battle)
+	return state
+}
+
+func boolUint32(value bool) uint32 {
+	if value {
+		return 1
+	}
+	return 0
+}
+
+func firstByte(value byte, fallback byte) byte {
+	if value != 0 {
+		return value
+	}
+	return fallback
+}

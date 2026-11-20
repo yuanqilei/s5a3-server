@@ -1,0 +1,171 @@
+package dnfbridge
+
+import (
+	"errors"
+	"fmt"
+	"strings"
+
+	"longheng.io/server/internal/modules/dnf/alignedcmd"
+	"longheng.io/server/internal/modules/dnf/dnfenum"
+	dnfpvf "longheng.io/server/internal/modules/dnf/pvf"
+)
+
+// alignedUpgradeTicketResolverForCommand keeps PVF loading request-driven.
+// Only the op50 upgrade command needs this dependency; other aligned commands
+// do not open or scan the item catalog. The resolver mirrors the 86JP
+// ItemUpgradeConsumableResolver: the material stackable's
+// [equipment reinforcement ticket] / [equipment amplify reinforcement ticket]
+// sections carry TargetLevel and SuccessRatePercent (weight = percent*1000),
+// [enchant random] provides weighted levels and equipment restrictions, and the
+// target equipment's [impossible contents] may forbid upgrade flows.
+func (s *Service) alignedUpgradeTicketResolverForCommand(opcode dnfenum.CmdPacket) (alignedcmd.UpgradeTicketResolver, error) {
+	if opcode != dnfenum.CmdPacketUpgradeItem {
+		return nil, nil
+	}
+	catalog, err := s.currentPVFItemCatalog()
+	if err != nil {
+		return nil, err
+	}
+	if catalog == nil {
+		return nil, errDungeonDropSourceRequired
+	}
+	s.initialEquipmentMu.Lock()
+	source, err := s.initialEquipmentArchiveLocked()
+	s.initialEquipmentMu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	return func(materialItemID int64, targetItemID int64) (alignedcmd.UpgradeTicketResolution, error) {
+		return resolveCurrentUpgradeTicketMetadata(catalog, source, materialItemID, targetItemID)
+	}, nil
+}
+
+// resolveCurrentUpgradeTicketMetadata resolves one op50 material/target pair
+// through the active runtime PVF. Materials that are not stackables or carry
+// no ticket section resolve with an empty TicketMode (the owner keeps the
+// request on the pending normal-reinforcement path); only catalog/document
+// read failures surface as errors so the mutation fails closed.
+func resolveCurrentUpgradeTicketMetadata(catalog *pvfDungeonDropCatalog, source dnfpvf.Source, materialItemID int64, targetItemID int64) (alignedcmd.UpgradeTicketResolution, error) {
+	if catalog == nil || source == nil {
+		return alignedcmd.UpgradeTicketResolution{}, errDungeonDropSourceRequired
+	}
+	resolution := alignedcmd.UpgradeTicketResolution{TargetMinimumLevel: -1, TargetRarity: -1}
+	if materialItemID <= 0 || materialItemID > int64(^uint32(0)) || targetItemID <= 0 || targetItemID > int64(^uint32(0)) {
+		return resolution, nil
+	}
+
+	materialDefinition, err := catalog.ResolveItem(uint32(materialItemID))
+	if err != nil {
+		if errors.Is(err, errDungeonDropItemUnresolved) {
+			return resolution, nil
+		}
+		return alignedcmd.UpgradeTicketResolution{}, fmt.Errorf("resolve upgrade ticket material item=%d: %w", materialItemID, err)
+	}
+	if materialDefinition.Kind != dungeonDropItemStackable {
+		return resolution, nil
+	}
+	materialDocument, err := parseDungeonCardPVFDocument(source, materialDefinition.PVFPath)
+	if err != nil {
+		return alignedcmd.UpgradeTicketResolution{}, fmt.Errorf("parse upgrade ticket material item=%d path=%s: %w", materialItemID, materialDefinition.PVFPath, err)
+	}
+	if values := materialDocument.Ints("equipment reinforcement ticket"); len(values) > 0 {
+		resolution.TicketMode = "reinforce"
+		resolution.TargetLevel = values[0]
+		resolution.SuccessWeight = upgradeTicketSuccessWeight(values)
+		resolution.TicketPVFPath = materialDefinition.PVFPath
+	} else if values := materialDocument.Ints("equipment amplify reinforcement ticket"); len(values) > 0 {
+		resolution.TicketMode = "amplify"
+		resolution.TargetLevel = values[0]
+		resolution.SuccessWeight = upgradeTicketSuccessWeight(values)
+		resolution.TicketPVFPath = materialDefinition.PVFPath
+	}
+	if _, found := materialDocument.Section("enchant random"); found {
+		resolution.TicketRandom = true
+		resolution.RandomTicket = parseUpgradeRandomTicket(materialDocument)
+		if resolution.TicketMode == "" {
+			resolution.TicketMode = "reinforce"
+			resolution.TicketPVFPath = materialDefinition.PVFPath
+		}
+	}
+	if resolution.TicketMode != "" {
+		resolution.MaterialUsableItemLevelMin, resolution.MaterialUsableItemLevelMax, resolution.MaterialUsableItemLevelSet = resolvePortableUsableItemLevel(materialDocument)
+		if _, found := materialDocument.Section("reinforcement usable item list"); found {
+			resolution.UsableItemIDs = append([]int64{}, materialDocument.Ints("reinforcement usable item list")...)
+		}
+	}
+	// 便携强化/增幅消耗品（一次性增幅器 / 凯丽的强化器）：厂商的
+	// `ItemUpgradeScene.Portable`，`[action type]` 记号是 `[portable upgrade]` /
+	// `[portable amplify]`（含 `[new …]` 变体）。判定真源与全部取证见
+	// upgrade_portable_consumable.go 的文件头。
+	if mode, levelMin, levelMax, bonus, ok := resolvePortableUpgradeConsumable(materialDocument); ok {
+		resolution.Scene = currentUpgradeScenePortable
+		resolution.PortableMode = mode
+		resolution.PortableLevelMin = levelMin
+		resolution.PortableLevelMax = levelMax
+		resolution.PortableSuccessBonus = bonus
+		resolution.TicketPVFPath = materialDefinition.PVFPath
+		// 同一件耗材的 `[check usable itemlevel]` 窗口（目标装备的 `[minimum level]` 必须落在
+		// 其中；厂商 FromPortable 装进 Restriction.ItemLevelMin/Max）。段缺席则 -1/-1 = 不限。
+		usableMin, usableMax, present := resolvePortableUsableItemLevel(materialDocument)
+		resolution.MaterialUsableItemLevelSet = present
+		resolution.MaterialUsableItemLevelMin = usableMin
+		resolution.MaterialUsableItemLevelMax = usableMax
+	}
+	if resolution.TicketMode == "" && resolution.PortableMode == "" {
+		return resolution, nil
+	}
+
+	targetDefinition, err := catalog.ResolveItem(uint32(targetItemID))
+	if err != nil {
+		if errors.Is(err, errDungeonDropItemUnresolved) {
+			return resolution, nil
+		}
+		return alignedcmd.UpgradeTicketResolution{}, fmt.Errorf("resolve upgrade ticket target item=%d: %w", targetItemID, err)
+	}
+	resolution.TargetKind = string(targetDefinition.Kind)
+	if targetDefinition.Kind != dungeonDropItemEquipment {
+		return resolution, nil
+	}
+	targetDocument, err := parseDungeonCardPVFDocument(source, targetDefinition.PVFPath)
+	if err != nil {
+		return alignedcmd.UpgradeTicketResolution{}, fmt.Errorf("parse upgrade ticket target item=%d path=%s: %w", targetItemID, targetDefinition.PVFPath, err)
+	}
+	// 目标装备的 `[minimum level]`：耗材的 `[check usable itemlevel]` 窗口比的就是它
+	// （厂商 EquipmentLevel = targetMetadata.MinimumLevel，InventoryItemUpgradeService.cs:388/401
+	// -> AllowsItemLevel(context.EquipmentLevel)，:486；EquipmentFile.cs:154 读同一段）。
+	resolution.TargetMinimumLevel = -1
+	if minimum, found := targetDocument.Int("minimum level"); found {
+		resolution.TargetMinimumLevel = int(minimum)
+	}
+	if rarity, found := targetDocument.Int("rarity"); found {
+		resolution.TargetRarity = rarity
+	}
+	for _, value := range targetDocument.Texts("impossible contents") {
+		normalized := strings.ToLower(strings.Trim(value, "` []"))
+		if normalized == "upgrade" || normalized == "amplify upgrade" {
+			resolution.TargetUpgradeForbidden = true
+			break
+		}
+	}
+	if equipmentType, found := targetDocument.Text("equipment type"); found {
+		resolution.TargetEquipmentType = equipmentType
+	}
+	return resolution, nil
+}
+
+// upgradeTicketSuccessWeight maps the ticket section's SuccessRatePercent to
+// the 86JP roll weight (percent*1000). A missing percent means a certain
+// success, matching the reference default.
+func upgradeTicketSuccessWeight(values []int64) int64 {
+	if len(values) < 2 {
+		return 100000
+	}
+	weight := values[1] * 1000
+	if weight < 0 {
+		return 0
+	}
+	if weight > 100000 {
+		return 100000
+	}
+	return weight
+}

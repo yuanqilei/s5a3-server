@@ -1,0 +1,68 @@
+package mysql
+
+import (
+	"context"
+	"strings"
+
+	"longheng.io/server/internal/modules/dnf/repository"
+)
+
+// 仅由结算事务中成功完整锁读的快照调用。不跨事务保留资格或资产状态。
+func saveChangedAccountMetadata(ctx context.Context, database SQLDB, table, id string, before, after map[string]string) error {
+	for _, key := range sortedStringKeys(before) {
+		if _, exists := after[key]; !exists {
+			if _, err := database.ExecContext(ctx, "DELETE FROM "+table+" WHERE account_id = ? AND entry_key = ?", id, key); err != nil {
+				return err
+			}
+		}
+	}
+	query := buildUpsert(table, []string{"account_id", "entry_key", "entry_value"}, []string{updateValue("entry_value")})
+	for _, key := range sortedStringKeys(after) {
+		if value, exists := before[key]; exists && value == after[key] {
+			continue
+		}
+		if _, err := database.ExecContext(ctx, query, id, key, after[key]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func permanentCharacterStat(key string) bool {
+	return strings.HasPrefix(key, repository.LevelUpEventStatPrefix) || strings.HasPrefix(key, repository.LevelUpRewardStatPrefix)
+}
+
+func characterStatSnapshotEligible(stats map[string]int64) bool {
+	for key := range stats {
+		if strings.HasPrefix(key, repository.LevelUpEventStatPrefix) {
+			if _, valid := repository.LevelUpEventLevel(key); !valid {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func saveChangedCharacterStats(ctx context.Context, database SQLDB, table, id string, before, after map[string]int64) error {
+	for _, key := range sortedStringKeys(before) {
+		if isMySQLCharacterMirrorStatKey(key) || permanentCharacterStat(key) || repository.IsCharacterWeddingStat(key) {
+			continue
+		}
+		if _, exists := after[key]; !exists {
+			if _, err := database.ExecContext(ctx, "DELETE FROM "+table+" WHERE character_id = ? AND stat_key = ?", id, key); err != nil {
+				return err
+			}
+		}
+	}
+	var changed []string
+	for _, key := range sortedStringKeys(after) {
+		if isMySQLCharacterMirrorStatKey(key) || repository.IsCharacterWeddingStat(key) {
+			continue
+		}
+		if value, exists := before[key]; exists && value == after[key] {
+			continue
+		}
+		changed = append(changed, key)
+	}
+	return writeCharacterStatRows(ctx, database, table, id, changed, after, true)
+}

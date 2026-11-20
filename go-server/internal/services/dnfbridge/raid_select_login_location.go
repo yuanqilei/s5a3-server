@@ -1,0 +1,121 @@
+package dnfbridge
+
+import (
+	"fmt"
+
+	"longheng.io/server/internal/modules/dnf/dnfenum"
+	dnfrepo "longheng.io/server/internal/modules/dnf/repository"
+)
+
+// Cold selection and manual channel reconnect must enter the same PVF room.
+// The ordinary login fallback must not replace a raid channel's registered room.
+func currentRaidLoginTownID(session *gameSession) (int64, bool) {
+	if session == nil {
+		return 0, false
+	}
+	switch session.channel.Type {
+	case dnfenum.RaidChannelType:
+		return 19, true
+	case dnfenum.HiddenRaidType:
+		return 32, true
+	default:
+		return 0, false
+	}
+}
+
+func (s *Service) currentCharacterListLoginLocationForSession(session *gameSession, characterID uint16, character dnfrepo.CharacterRecord) (currentTownLoginLocation, int64, string, string, error) {
+	if isCurrentFiendWarChannel(session) {
+		loc, err := s.currentFiendWarLoginLocation(session, characterID)
+		return loc, character.Stats["town_id"], "", "", err
+	}
+	if s.isCurrentTagTournamentChannel(session) {
+		location, err := s.currentTagTournamentLoginLocation(character)
+		return location, character.Stats["town_id"], "", "", err
+	}
+	townID, raidChannel := currentRaidLoginTownID(session)
+	if !raidChannel {
+		// 超时空退场保留上游的原位恢复；经过其他专用频道仍沿首次普通来源。
+		// 普通换线及未经过超时空的决斗退场继续使用所属城镇的房间。
+		if s.currentLoginLeavingChannelTown(session, character) &&
+			(character.Stats["town_id"] == 98 || character.Stats[currentFiendWarReturnOriginMarker] == 1) {
+			location, err := s.currentRaidExitLoginLocation(characterID, character)
+			return location, character.Stats["town_id"], "", "", err
+		}
+		ordinary, err := s.currentOrdinaryLoginOriginCharacter(session, characterID, character)
+		if err != nil {
+			return currentTownLoginLocation{}, character.Stats["town_id"], "", "", err
+		}
+		return s.currentCharacterListLoginLocation(characterID, ordinary)
+	}
+	location, found, reason := s.currentTownSeriaRoomLoginLocation(townID)
+	if !found {
+		return currentTownLoginLocation{}, -1, "", "", fmt.Errorf("raid login room unavailable: %s", reason)
+	}
+	persistedTownID := int64(-1)
+	if saved, found, _ := currentPersistedTownLoginTownID(character); found {
+		persistedTownID = saved
+	}
+	location.Branch = "raid_channel_seria_room"
+	location.Source = "raid_channel_runtime_pvf_seria_room"
+	return location, persistedTownID, "", "", nil
+}
+
+// 特殊频道只保存专用城镇位置；普通登录先恢复本角色已验证的入场来源，
+// 再按该城镇选择房间。只改副本，不提前写库或清除来源标记。
+func (s *Service) currentOrdinaryLoginOriginCharacter(session *gameSession, characterID uint16, character dnfrepo.CharacterRecord) (dnfrepo.CharacterRecord, error) {
+	if !s.currentLoginLeavingChannelTown(session, character) {
+		return character, nil
+	}
+	var location currentTownLoginLocation
+	var err error
+	if character.Stats["town_id"] == 10 {
+		location, err = s.currentPVPExitLoginLocation(characterID, character)
+	} else {
+		location, err = s.currentRaidExitLoginLocation(characterID, character)
+	}
+	if err != nil {
+		return dnfrepo.CharacterRecord{}, err
+	}
+	projected, _, _, _, _, err := currentReconnectLocationProjection(characterID, character, location)
+	return projected, err
+}
+
+func (s *Service) currentLoginLeavingChannelTown(session *gameSession, character dnfrepo.CharacterRecord) bool {
+	if session == nil {
+		return false
+	}
+	if _, raidChannel := currentRaidLoginTownID(session); raidChannel || isCurrentFiendWarChannel(session) || isPVPChannel(session.channel) || s.isCurrentTagTournamentChannel(session) {
+		return false
+	}
+	return s.currentDedicatedChannelTown(character.Stats["town_id"])
+}
+
+func currentRegisteredRaidTown(townID int64) bool {
+	// Same registered towns as the Anton and Luke channel landing above.
+	return townID == 19 || townID == 32 || townID == 98
+}
+
+func currentRegisteredChannelTown(townID int64) bool {
+	// 专用城镇不能作为普通频道落点或覆盖普通城镇的返城原位。
+	return townID == 10 || currentRegisteredRaidTown(townID)
+}
+
+func (s *Service) currentSessionSelectAckTownID(session *gameSession, character dnfrepo.CharacterRecord, characterID uint16, slot int) (uint8, string, error) {
+	if _, raidChannel := currentRaidLoginTownID(session); raidChannel || isCurrentFiendWarChannel(session) || s.isCurrentTagTournamentChannel(session) {
+		location, _, _, _, err := s.currentCharacterListLoginLocationForSession(session, characterID, character)
+		if err != nil {
+			return 0, "", err
+		}
+		return location.TownID, location.Source, nil
+	}
+	townID, source, ok := currentSelectAckTownID(slot)
+	if !ok {
+		return 0, source, fmt.Errorf("current select ACK town outside u8")
+	}
+	return townID, source, nil
+}
+
+// 保留上游既有入口名称，专用城镇判定仍统一收口。
+func (s *Service) currentLoginLeavingRaidTown(session *gameSession, character dnfrepo.CharacterRecord) bool {
+	return s.currentLoginLeavingChannelTown(session, character)
+}

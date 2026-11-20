@@ -1,0 +1,299 @@
+package dnfbridge
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+)
+
+// r195SignalConn records the first write on a member socket so the regression
+// can observe "this member was already released" without timing thresholds.
+type r195SignalConn struct {
+	*bufferConn
+	once  sync.Once
+	wrote chan struct{}
+}
+
+func newR195SignalConn(conn *bufferConn) *r195SignalConn {
+	return &r195SignalConn{bufferConn: conn, wrote: make(chan struct{})}
+}
+
+func (c *r195SignalConn) Write(data []byte) (int, error) {
+	c.once.Do(func() { close(c.wrote) })
+	return c.bufferConn.Write(data)
+}
+
+// r195PrepareLoadingTail makes the next finish-loading call run the op37/op30
+// tail for a member that has not sent them yet. The PVF-dependent post-finish
+// segment stays marked as already sent, matching the existing party tail tests.
+func r195PrepareLoadingTail(sessions ...*gameSession) {
+	for _, session := range sessions {
+		session.connID = fmt.Sprintf("game-%04d", session.selectedCharacterID)
+		session.currentFinishLoadingStateSent = false
+		session.currentFinishLoadingCompletionSent = false
+		session.postFinishLoadingPlayerStateSent = true
+	}
+}
+
+func r195RegisterLoadingCycle(t *testing.T, service *Service, partyID uint16, sessions ...*gameSession) *partyDungeonLoadingCycle {
+	t.Helper()
+	owners := make(map[uint16]partyDungeonLoadingOwner, len(sessions))
+	ready := make(map[uint16]bool, len(sessions))
+	members := make([]uint16, 0, len(sessions))
+	for _, session := range sessions {
+		id := session.selectedCharacterID
+		members = append(members, id)
+		owners[id] = snapshotPartyDungeonLoadingOwner(session)
+		ready[id] = true
+	}
+	cycle := &partyDungeonLoadingCycle{PartyID: partyID, Cycle: 1, Ready: ready, owners: owners, membersAt: members}
+	service.partyDungeonLoadingMu.Lock()
+	service.partyDungeonLoadingBarrierCyclesLocked()[partyID] = cycle
+	service.partyDungeonLoadingMu.Unlock()
+	return cycle
+}
+
+func r195LoadingReleasedLine(logText string, charID uint16) bool {
+	for _, line := range strings.Split(logText, "\n") {
+		if !strings.Contains(line, "kind=game-party-dungeon-loading-released") {
+			continue
+		}
+		if strings.Contains(line, fmt.Sprintf("char_id=%d ", charID)) {
+			return true
+		}
+	}
+	return false
+}
+
+// Each loop can prepare independently, but neither scene may activate while
+// one loop remains blocked. This replaces the earlier independent-release rule.
+func TestR195LoadingReleaseRunsMembersOnTheirOwnLoops(t *testing.T) {
+	service, leader, follower, _, _ := partyDungeonDeathFixture(t)
+	logger, _ := newPeerEndpointTestLogger(t)
+	service.packetLog = logger
+	t.Cleanup(func() { _ = logger.Close() })
+	r195PrepareLoadingTail(leader, follower)
+
+	leaderConn := leader.conn.(*bufferConn)
+	followerConn := follower.conn.(*bufferConn)
+	leaderConn.write.Reset()
+	followerConn.write.Reset()
+	signal := newR195SignalConn(followerConn)
+	follower.conn = signal
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	for _, session := range []*gameSession{leader, follower} {
+		if err := service.startGameSessionEvents(ctx, session); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	partyID := uint16(4211)
+	cycle := r195RegisterLoadingCycle(t, service, partyID, leader, follower)
+	members := []uint16{leader.selectedCharacterID, follower.selectedCharacterID}
+
+	gateStarted := make(chan struct{})
+	gateRelease := make(chan struct{})
+	var gateOnce sync.Once
+	openGate := func() { gateOnce.Do(func() { close(gateRelease) }) }
+	defer openGate()
+	go func() {
+		_ = service.callGameSession(context.Background(), leader, "r195-loading-gate", func() error {
+			close(gateStarted)
+			<-gateRelease
+			return nil
+		})
+	}()
+	<-gateStarted
+
+	done := make(chan struct{})
+	go func() {
+		service.releasePartyDungeonLoadingCycle(partyID, cycle, members, members, "r195_parallel_release")
+		close(done)
+	}()
+
+	deadline := time.Now().Add(5 * time.Second)
+	prepared := false
+	for time.Now().Before(deadline) {
+		service.partyDungeonLoadingMu.Lock()
+		p := cycle.preparing[follower.selectedCharacterID]
+		prepared = p != nil && p.ready
+		service.partyDungeonLoadingMu.Unlock()
+		if prepared {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if !prepared {
+		t.Fatal("healthy loop did not prepare while peer was blocked")
+	}
+	select {
+	case <-signal.wrote:
+		t.Fatal("follower activated before blocked peer prepared")
+	default:
+	}
+	openGate()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("release did not return after the gate opened")
+	}
+	for _, session := range []*gameSession{leader, follower} {
+		limit, cancelWait := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancelWait()
+		for {
+			ready := false
+			if err := service.callGameSession(limit, session, "loading-shared-activation-observe", func() error { g := session.finishLoadingGateSnapshot(); ready = g.State && g.Completion; return nil }); err != nil {
+				t.Fatal(err)
+			}
+			if ready {
+				break
+			}
+			select {
+			case <-limit.Done():
+				t.Fatal("shared activation lost")
+			case <-time.After(time.Millisecond):
+			}
+		}
+	}
+	text := testPacketLogText(t, service)
+	for _, id := range members {
+		if !r195LoadingReleasedLine(text, id) {
+			t.Fatalf("member %d was not released:\n%s", id, text)
+		}
+	}
+}
+
+// A cycle that is no longer the live one must never place or release anybody.
+func TestR195LoadingReleaseStaleCycleDoesNotRelease(t *testing.T) {
+	service, leader, follower, _, _ := partyDungeonDeathFixture(t)
+	logger, _ := newPeerEndpointTestLogger(t)
+	service.packetLog = logger
+	t.Cleanup(func() { _ = logger.Close() })
+	r195PrepareLoadingTail(leader, follower)
+	leaderConn := leader.conn.(*bufferConn)
+	followerConn := follower.conn.(*bufferConn)
+	leaderConn.write.Reset()
+	followerConn.write.Reset()
+
+	partyID := uint16(4212)
+	cycle := r195RegisterLoadingCycle(t, service, partyID, leader, follower)
+	stale := &partyDungeonLoadingCycle{PartyID: partyID, Cycle: 0, owners: cycle.owners}
+	members := []uint16{leader.selectedCharacterID, follower.selectedCharacterID}
+	service.releasePartyDungeonLoadingCycle(partyID, stale, members, members, "r195_stale_cycle")
+
+	if leaderConn.write.Len() != 0 || followerConn.write.Len() != 0 {
+		t.Fatal("stale cycle released a member")
+	}
+	if text := testPacketLogText(t, service); r195LoadingReleasedLine(text, leader.selectedCharacterID) || r195LoadingReleasedLine(text, follower.selectedCharacterID) {
+		t.Fatalf("stale cycle logged a release:\n%s", text)
+	}
+}
+
+// The owner guard is evaluated inside the session event: a member whose scene
+// owner changed after the cycle froze its owners is skipped; the peer also
+// waits for the replacement scene instead of showing an incomplete party.
+func TestR195LoadingReleaseStaleOwnerIsNotReleased(t *testing.T) {
+	service, leader, follower, _, _ := partyDungeonDeathFixture(t)
+	logger, _ := newPeerEndpointTestLogger(t)
+	service.packetLog = logger
+	t.Cleanup(func() { _ = logger.Close() })
+	r195PrepareLoadingTail(leader, follower)
+	leaderConn := leader.conn.(*bufferConn)
+	followerConn := follower.conn.(*bufferConn)
+	leaderConn.write.Reset()
+	followerConn.write.Reset()
+
+	partyID := uint16(4213)
+	cycle := r195RegisterLoadingCycle(t, service, partyID, leader, follower)
+	leader.dungeon.mu.Lock()
+	leader.dungeon.runToken++
+	leader.dungeon.mu.Unlock()
+
+	members := []uint16{leader.selectedCharacterID, follower.selectedCharacterID}
+	service.releasePartyDungeonLoadingCycle(partyID, cycle, members, members, "r195_stale_owner")
+
+	text := testPacketLogText(t, service)
+	// The follower's own peer-actor tail writes to the leader's socket, so the
+	// release signal here is the leader's "-released" line, not its socket length.
+	if r195LoadingReleasedLine(text, leader.selectedCharacterID) {
+		t.Fatalf("stale owner was released:\n%s", text)
+	}
+	if r195LoadingReleasedLine(text, follower.selectedCharacterID) || followerConn.write.Len() != 0 {
+		t.Fatalf("peer was released while replacement owner was not ready:\n%s", text)
+	}
+}
+
+func r195PeerActorSendCount(t *testing.T, logs string, receiver, actor uint16) int {
+	t.Helper()
+	count := 0
+	for _, line := range strings.Split(strings.TrimSpace(logs), "\n") {
+		var event map[string]any
+		if json.Unmarshal([]byte(line), &event) != nil {
+			continue
+		}
+		if event["kind"] != "game-dungeon-party-peer-actor-send" {
+			continue
+		}
+		if event["receiver_char_id"] == float64(receiver) && event["actor_char_id"] == float64(actor) {
+			count++
+		}
+	}
+	return count
+}
+
+// Both resend owners share one claim per (receiver, actor): the finish-loading
+// tail resends the peer actor into the member that just loaded, and the landing
+// resend re-pushes the just-landed member's own actor into an already stable
+// peer. Whichever fires first must deliver exactly one body per direction, and
+// the second one plus a repeat pass must not send it again.
+func TestR195LoadingReleasePeerResendIsExactlyOncePerPair(t *testing.T) {
+	for _, order := range []string{"leader_first", "follower_first"} {
+		t.Run(order, func(t *testing.T) {
+			t.Setenv(dungeonPartyPeerActorLandingResendEnv, "on")
+			service, leader, follower, _, _ := partyDungeonDeathFixture(t)
+			var logs bytes.Buffer
+			service.logger = slog.New(slog.NewJSONHandler(&logs, nil))
+			for _, session := range []*gameSession{leader, follower} {
+				session.connID = fmt.Sprintf("game-%04d", session.selectedCharacterID)
+				session.currentFinishLoadingStateSent = true
+				session.currentFinishLoadingCompletionSent = true
+				session.postFinishLoadingPlayerStateSent = true
+			}
+			first, second := leader, follower
+			if order == "follower_first" {
+				first, second = follower, leader
+			}
+			// First member finishes loading: its tail resends the peer actor into
+			// its own (stable) scene.
+			service.resendDungeonPartyPeerActorsAfterFinishLoading(first, "r195_order_"+order)
+			// Second member lands: the landing resend covers the same pair.
+			service.resendDungeonPartyPeerActorToAlreadyLandedMembers(second, "r195_order_"+order)
+			// Opposite direction, in the same order.
+			service.resendDungeonPartyPeerActorsAfterFinishLoading(second, "r195_order_"+order)
+			service.resendDungeonPartyPeerActorToAlreadyLandedMembers(first, "r195_order_"+order)
+			// A repeated pass must add nothing.
+			service.resendDungeonPartyPeerActorsAfterFinishLoading(first, "r195_order_repeat")
+			service.resendDungeonPartyPeerActorsAfterFinishLoading(second, "r195_order_repeat")
+			service.resendDungeonPartyPeerActorToAlreadyLandedMembers(first, "r195_order_repeat")
+			service.resendDungeonPartyPeerActorToAlreadyLandedMembers(second, "r195_order_repeat")
+
+			text := logs.String()
+			if got := r195PeerActorSendCount(t, text, first.selectedCharacterID, second.selectedCharacterID); got != 1 {
+				t.Fatalf("%s: receiver=%d actor=%d peer sends=%d want exactly 1\n%s",
+					order, first.selectedCharacterID, second.selectedCharacterID, got, text)
+			}
+			if got := r195PeerActorSendCount(t, text, second.selectedCharacterID, first.selectedCharacterID); got != 1 {
+				t.Fatalf("%s: receiver=%d actor=%d peer sends=%d want exactly 1\n%s",
+					order, second.selectedCharacterID, first.selectedCharacterID, got, text)
+			}
+		})
+	}
+}

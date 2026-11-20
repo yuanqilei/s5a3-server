@@ -1,0 +1,138 @@
+## 2026-11-15 日常 CI 精简为持续工作约定
+
+日常修复选择相关包，bridge指定明确 `--run`，默认Go缓存；数据库/PVF、外部状态、时间或并发复现需新执行时才fresh。保留受影响调用方、list/test/vet、边界、依赖及完整Linux正式构建；纯文档/工具按自身范围检查。主干累计后审查新增diff，只补受影响验证；新quick声明绑定当前精确SHA并引用未变证据。必要检查通过且无新变更/失败/未决疑点时，不继续无理由重复或扩大。full/race按影响使用；prepare不重复贡献测试。入口、参数与证据规则见 [本地验证与精简发布载荷](Docs/LOCAL_CICD.md)。本条替代更早日常强制无缓存全量、主干任意前进就全量重测的做法。
+
+## 2026-11-05 可信开发者 quick
+
+仓库负责人已批准Cec1c、16www两位写权限开发者使用 `SOURCE_MERGE.bat --quick`，以绑定精确SHA的本地通过文字声明取得 `merge-ready` 合入资格，跳过远端CI等待。普通外部PR继续走CI；声明记为local-attested，不伪称cloud CI已通过。多个小修复合批验证，源码累计后直接prepare。详见 `Docs/TRUSTED_QUICK_MERGE.md`；私有入口支持 `GAME_UPDATE_REMOTE.bat prepare --quick` 串接公开合入/私有累计。备份完成后才交扳机，触发后不再准备；从决定部署到结果告知记录整轮时间。
+
+# DNF90 Project Working Agreement
+
+## 2026-11-04 合批 CI 与接收端验哈
+
+遵循 [合批发布规则](Docs/PUBLICATION_BATCHING.md)：已完成的小修复尽量合入一个累计 PR，保留各自提交与记录，最终 ready 组合跑一次完整 CI；Draft 只做范围检查，手动分支 CI 保留。部署不重跑完整测试。程序、资源及回退准备提前完成，接收端计算 SHA256 后只返回小回执，禁止将整包搬回开发机仅为验哈。相同不可变对象复用，切换不传大文件；本条替代下文旧重复拉取/全量回传要求。
+
+## 2026-11-02 GitHub 权威与 Linux CI（替代旧 GitGud 权威/Windows 门禁）
+
+- 公开源码唯一权威为 https://github.com/Cec1c/ServerS5A3 `master`；所有公开功能、测试、文档和 CI 用 GitHub PR。GitGud 仅为异步单向快进镜像，镜像状态、自建 Runner 和旧 MR CI 不作为合并、群服同步或部署门槛。
+- 服务端只验证与构建 Linux，禁用 Windows CI 和 Windows 交叉构建。Windows 开发机的 BAT/Python 发布入口保留。公开 PR 在 GitHub 托管 Linux Runner 按路径分流；同 PR 取消过时纯验证，不在普通分支 push 和合并 push 重跑全套，不上传六份构建附件。
+- 群服已配置的私有累计仓库 `master` 仍为群服部署唯一权威，公开修复经 GitHub PR 后直接同步，群服内容用私有 `group/` PR。私有累计历史与配置不得回流公开。
+- 部署 prepare 不再重复 Go test/vet、Windows 构建和真实 PVF 回归；执行依赖校验和当次最新权威源码的 Linux 正式 server 构建，记录 `mode=linux-build-only`、`testsExecuted=false`。不是导入或复用 CI 证据。新缺陷/输入变化的必要专项在贡献阶段按范围执行。
+- 保留实际 pull、累计范围/资源身份、备份/回退、当次维护批准、串行切换及程序/健康读回。纯工具更新不重启游戏。同步与部署任务不自动取消；已确认范围不重复询问，断线先查原 request。
+- 完整开发机迁移与可转交说明见 [GitHub 权威迁移](Docs/GITHUB_AUTHORITY_MIGRATION.md)。下文早期同输入缓存/CGO必重测等约束不再用于部署准备，旧历史记录仅作留档。
+
+
+## Start Here
+
+- CI 并行与限额变更遵循 [Runner 容量规范](Docs/CI_RUNNER_CAPACITY.md)：提高槽位时同时约束全部 CI 容器总资源，保持必要检查和附件回执；先测业务与资源影响，不将 Runner 服务自身限额当作 Docker 作业总限额。
+
+- **每次新部署必须当场拉取上游**：在本次部署 run 内，对专用干净权威主干工作树执行 `git pull --ff-only`，来源必须是 GitHub `Cec1c/ServerS5A3 master`，并记录执行时间、来源、拉取前后 SHA。核对候选已集成最新主干及有效改动，同时保留线上累计修复和本服扩展。拉取失败、来源不符、分叉或漏接更新时，在打包、上传、切换前拒绝执行。构建完成后再次拉取；有新提交则重新集成和验证。历史拉取回执、本地旧引用或口头确认不能替代本次检查。
+- **单独发布客户端也必须先 pull**：每次客户端更新、构建发布准备及仅客户端发布均执行上述权威主干实际拉取、证据记录、独立集成与固定提交构建检查；发布前再核对上游和实际玩家通道，有变化则重新集成验证。禁止直接将当前工作区或旧构建目录打包发布。
+- 已授权远端更新使用 `GAME_UPDATE_REMOTE.bat`，先 inspect actual active，再由 deploy 强制核对最新主干、完整范围、测试构建、备份、运行摘要、签名与频道；私有 profile 和累计基线不上传。工具及恢复来源约束见 [Docs/GAME_UPDATE.md](Docs/GAME_UPDATE.md)。
+
+- Read recent `changelog.d/` entries and relevant design notes before changes; consult `changlog.md` for historical context. Follow [the change-note workflow](Docs/CHANGELOG_WORKFLOW.md).
+- 部署前先读 [外部频道表选择与验收](Docs/CHANNEL_TABLE_DEPLOYMENT.md)，按仓库120频道CSV核对公私统一的完整外部表（SHA256 `5630b099ef98e322806c35cec25be7c7aae699ebfbc8f16e60f1a70d12bfe7d7`）。新建Docker prepare默认选定该表；显式 `--channel-info` 也须匹配同一基线。已有不同运行表先备份并按文档迁移；不从PVF提取目录替代，升级PVF时保留外部表。运行 `python scripts/check_channel_table.py` 防止ETC、历史副本与CSV漂移。CSV仅供核对，运行输入必须是完整ETC，并读回实际进程路径、摘要、端口及客户端目录。
+- Keep `go-server` source-only. Runtime configuration, binaries, logs, PVF, database state, and PID files belong under `runtime`.
+- Edit `runtime/config/instance.json` or `deploy/templates/instance.example.json`; do not hand-edit generated files under `runtime/configs`.
+- Windows deployment entrypoints must stay BAT-only. Do not add PowerShell scripts or PowerShell calls.
+
+## 写作与结论表达
+
+直接陈述结论、依据和行动，不使用重复免责、预设反驳和自我辩护。影响判断的前提、不确定性与未完成项保留一次，用具体事实说明。
+
+## Seeker 研究与执行工作流
+
+- **先自主调查，再请求补充**：可识别的功能和现象即可开始；自行从代码、匹配PVF/客户端及现成证据定位并尝试复现，必要时建立最小夹具，按问题检查执行者与队友/观察者链路。缺日志或一次未复现不构成 `needs_info` 理由；仅在实际尝试后仍有不可自行还原的关键条件或已核实的基础设施缺口，且替代方法仍无法继续时，记录尝试、结果和具体卡点，再问最少必要项。续接时重审仅因缺日志挂起的旧条目，细则见 [BUG持续流水线](Docs/seeker/ISSUES_API_WORKFLOW.md)。
+- 论坛反馈按 [BUG持续流水线](Docs/seeker/ISSUES_API_WORKFLOW.md) 先查重、判断合理性/功能BUG和复现信息，再按影响校正优先级；选中批次分派当前账号并回复日期流水线，修复验证后按授权上传合并MR，在原反馈回写分支、MR、合并SHA及验收状态。
+- 用户指定当前会话为 Seeker 或调用 Seeker 工作流时，按 [Seeker 工作流](Docs/SEEKER_WORKFLOW.md) 推进：Astra 取证、解释成因、在 `Docs/seeker/` 留可公开方案；DeepSeek Flash 执行明确的小任务；Astra 验收关键结果。
+- 方案写清目标、必要文件、解决思路、测试与验收条件，简洁直接。明确告诉执行者：允许失败，返回已尝试方法、失败证据和下一步所需信息。
+- 默认一次一个 DeepSeek Flash 执行子代理，`max`、最小上下文、不嵌套；复杂问题由 Seeker 处理，或交用户指定的同模型 Helper。当前任务的委派授权随交接记录保存，其他会话仍按用户当次指令启用。
+- 任务板块优先主线相关问题；原文涂色表示其他人已完成，默认跳过且不计入本轮成果。PVF 写入交用户指定的 PVF-Writer；同步与发布交 Syncer，并传递本次授权范围及依赖。
+- 可按证据需要使用代码/Git 搜索、日志与协议探针、真实 PVF 只读查询、REA/IDA/Capstone 静态分析、浏览器原格式读取和隔离测试。工具与模型以当前可用能力为准；Pebrel 面板先核对身份再派工。
+- 公共方案只保留可复用技术结论；原始 BUG、截图、环境及面板身份保存在 ignored `local-notes/seeker/`。入口、任务状态和续接方法见该目录及 `local-notes/AGENT_HANDOFF.md`。
+
+## Source Boundaries
+
+- `go-server/internal/app/dnf90` is the single composition root.
+- `go-server/internal/services/dnfbridge` owns transport, session state, packet ordering, and current-client compatibility.
+- `go-server/internal/modules/dnf` owns DNF domain rules and repository transactions.
+- `go-server/internal/services/logic/dnf` owns repository assembly.
+- Do not split the large bridge package merely for cosmetic directory changes. Extract only behind tests and current-client evidence.
+
+## Data and Protocol Rules
+
+- 服务端修复若依赖 EXE 变更，必须先发布最终 EXE Release 并同步指定镜像，再核验玩家实际更新源/通道的签名清单、下载文件摘要及配套 PVF/dstr/NPK 与批准 profile 一致，最后部署依赖服务端。任一环节未更新或摘要不同即停止上线；preview 不能代替玩家仍使用的 stable。完整流程见 `Docs/CLIENT_RELEASE_SYNC.md`。
+
+- Current EXE behavior is authoritative for uncertain packet layouts.
+- Never invent inventory, character, database, PVF, channel, or map data to hide a missing dependency.
+- The local profile is single-account and local-only. The 90CN bootstrap/channel download endpoint, admin endpoint, and MySQL stay on loopback. Dynamic channel-directory advertisements and every game port must use an automatically detected or explicitly configured private LAN IPv4 and bind only that local interface; never use a wildcard or public address.
+- The `90cn-decode-bypass-v1` protocol profile, asset hashes, and client hashes are a compatibility unit. Change them together and record evidence.
+
+## 来源通知工具与客户端累计发布
+
+- anti-RE v0.2.0 是来源通知工具，保留通知与三处编码的轻量文案隐藏，已移除整文件 SHA 白名单和运行时防篡改。按黑盒 CLI 使用，默认只读 README、使用说明和输入/输出契约；非任务确需不深入实现，不恢复旧保护或把工具报错绕过。
+- V183 已作为一次性来源通知基线正式发布；工具版本、配置、输入/输出 SHA256 与验证记录留档，实际游戏验收按独立回执记录。后续以正式基线及最新累计成品为输入，不用早期候选覆盖后续修改。
+- V183 正式基线发布后，其他开发者从该基线及其后续累计版本恢复直接修改 EXE、验证并交付的流程。普通修复或新 Release 不要求重新运行通知 CLI；SHA 改变只记录为新的文件身份。此前“每次新 Release 必须加锁、每次修改后重新经过 CLI”的规则已被本条替代。
+- 普通修复保留通知新增节、挂接指令及依赖关系，输出独立候选，不将挂接恢复为未注入原指令。涉及通知位置、相关函数地址、调用约定、对象布局、所有权或消息流程时协调适配。需要时可自愿执行 `anti-re.exe verify --input <候选>` 检查通知结构；它不运行游戏，也不替代功能及游戏内验收。
+- 维护一键更新、发布、镜像及 Hub 时，沿用最新累计 EXE、所选通道最新已发布 Release、签名与最终下载摘要核对；不增加每次发版必须调用 anti-RE 的门槛。顺序仍为：修复验证与所需验收 → Release/指定镜像 → 玩家实际通道读回 → 依赖服务端部署。工具已发布、EXE 候选、正式基线及线上状态分别记录。
+- 旧 Release 清理由用户指定的独立进程负责；不自行删除或从另一端补回已清理版本。已退役版本不能替代当前累计基线；现有运行组合和回退产物按既有发布流程保留。
+
+## 客户端函数索引与静态取证
+
+- 公共入口见 [客户端函数与协议索引](Docs/CLIENT_FUNCTION_INDEX.md)，机器可读记录在 `Docs/client-functions/`。该索引已获用户授权公开并同步；只收录模块摘要、RVA、脱敏语义及公共证据。原始反编译、私人报文和环境资料保存在被忽略的 `.cache/` 或 `local-notes/`。
+- 复用前匹配完整模块 SHA256，区分函数入口、函数内片段和导出符号；新版本新增记录，不套用旧地址。协议方向、类别和证据限制以条目为准，不用候选地址或符号名证明业务功能。
+- 优先从服务端代码、日志及匹配 PVF 定位；小窗口使用 Capstone，需要伪代码或跨函数关系时再用 REA/IDA。REA 的 IDA 提供者仍依赖相应 MCP 后端，工具接入不等于目标分析成功。
+- 默认静态只读，不启动游戏/登录器或修改玩家原文件。分析结束显式关闭会话并核实所属 worker 释放；原始反编译留在 ignored 目录。索引文档变更核对摘要、地址、引用及隐私即可，不据此宣称重新部署或游戏验收。
+
+## 独立 GM 仓库边界
+
+- GM 的页面、鉴权、物品查询、福利扫描、批量任务和部署入口迁往 https://github.com/Cec1c/DNF90GM 。不得将其实现重新放回本仓。
+- 服务端保留私有管理 API v1、邮件/资产事务与 `signupbenefits` 初始化政策。原表名、回执和注册额度快照保持兼容。
+- 现有启用 GM 的部署 profile 需先按 `Docs/GM_STANDALONE.md` 迁移；仓库清理不停止线上 GM，不删除福利数据。
+- 修改后执行 `python scripts/check_server_boundary.py`，检查已跟踪源码和游戏二进制的依赖边界。
+
+## Validation commands
+
+- 日常本地验证按改动与依赖选择领域包，bridge 指定能覆盖原问题的 `-run`，加相关 vet 和 Linux server 构建。默认使用 Go 测试缓存；真实数据库、外部资源、时间/并发复现或明确需要新执行时加 `-count=1`。`-run` 减少执行的用例，不缩小 Go 的 package 编译单位。
+- Windows 开发机的 Linux 构建/测试使用 Docker；不启动或借用 Kali。`LOCAL_VERIFY.bat` 直接只读挂载源码，共享命名 Go 缓存卷，不为验证打全仓 tar。见 [本地验证与精简载荷](Docs/LOCAL_CICD.md)。
+- 新的独立纯逻辑/SQL/编解码测试优先放在所属小包；需要 bridge 会话/协议集成的回归保留在 bridge，不为目录拆分扩大修改。
+- 仓储契约、事务/锁、会话排序、公共依赖或跨领域改造扩大相关验证，必要时执行全量。普通单点修复不固定重跑全部领域、bridge 和部署脚本；云端现有完整检查与手动全量入口保留。
+- 主干前进后实际 merge/rebase 并审查累计 diff。纯文档变化且运行输入不变可沿用原测试证据；代码变化按依赖补受影响检查。新 READY 绑定新 SHA，引用旧测试与新增检查，不声称旧 READY 验证了新 SHA；文件不相交不等于语义无依赖。
+
+在干净已提交工作树运行（输出目录每次独立）：
+
+```text
+LOCAL_VERIFY.bat --package ./internal/modules/dnf/inventory/... --output runtime/verify/inventory-01
+LOCAL_VERIFY.bat --package ./internal/services/dnfbridge --run "TestAuction" --output runtime/verify/auction-01
+LOCAL_VERIFY.bat --package ./internal/modules/dnf/repository/mysql --race --uncached --output runtime/verify/mysql-01
+LOCAL_VERIFY.bat --full --output runtime/verify/full-01
+```
+
+改 Go 文件先 `gofmt`。仅文档/工具变化运行相应校验，不触发 Go 全量。Linux CI 的 `sh scripts/ci/test_core.sh` 仍执行原完整范围，默认允许测试缓存；`GO_TEST_UNCACHED=1` 可强制新执行。prepare 仍只做最新权威源码新构建，不重复贡献测试。
+
+Run deployment preflight without a database:
+
+```text
+..\deploy\windows\control.bat check --skip-database
+```
+
+## Documentation
+
+- Every contribution adds its own `changelog.d/YYYYMMDD-unique-slug.type.md` (fix/feature/change/docs, category `功能修复`). Merged fragments and historical `changlog.md` are immutable; corrections use new fragments. Private downstream content belongs only in its private `.pos5a3/changelog.d/` with category `群服内容`.
+- CI validates fragments and renders artifacts; release notes are generated for a fixed commit range, never written back on each merge. Legacy append-only conflicts may use the strict resolver described in `Docs/CHANGELOG_WORKFLOW.md`; all other conflicts require review. Do not configure a blanket union/ours merge driver.
+- Never record plaintext generated passwords in `changlog.md`, logs, screenshots, commits, or support bundles.
+- The requested runtime profile deliberately uses a plaintext `root` DSN. Keep it loopback-only and never commit generated runtime configuration.
+
+- 客户端 EXE 发布资产在上游 GitGud Release 与本方 GitHub Release 之间直接双向同步；GitGud fork 不再用于新源码贡献，不参与 Release 镜像。EXE 同步不构建或部署服务端，源码通过 GitHub PR 进入公开权威主干。
+
+## Repository Boundary
+
+- This online repository contains the game server only. The GM tool is an independent local system.
+- Do not commit GM UI, HTTP tool implementation, embedded startup wiring, tool configuration, or tool releases here.
+- Preserve local GM files and changes. Repository cleanup must not delete the user's local tool.
+- Shared gameplay/domain rules and server administration infrastructure may remain when used by the server; do not delete gameplay logic merely because GM also calls it.
+
+## 源码唯一权威与贡献
+
+- 同步 Agent 自行妥善解决冲突，保留双方有效逻辑，验证后非强推更新；有用户授权时按评审要求合并，并读回上游最终 SHA。
+- 详见 Docs/REPOSITORY_SYNC.md。源码、Release、玩家通道、服务端累计部署和实机验收分别记录；私有累计源码不得直接上传公开上游。

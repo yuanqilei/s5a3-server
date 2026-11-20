@@ -1,0 +1,162 @@
+package dungeon
+
+import (
+	"context"
+	"fmt"
+	dnffatigue "longheng.io/server/internal/modules/dnf/fatigue"
+	onlineevent "longheng.io/server/internal/modules/dnf/onlineevent"
+	dnfrepo "longheng.io/server/internal/modules/dnf/repository"
+	"math"
+	"strings"
+	"time"
+)
+
+const EpicEntrySequenceKey = "epic_entry_sequence"
+const epicEntryNonceKey = "epic_entry_nonce"
+const epicEntryDungeonKey = "epic_entry_dungeon"
+
+// EpicEntryTicketCount is limited to the three current 369d consuming dungeons.
+func EpicEntryTicketCount(id int64) (int64, bool) {
+	switch id {
+	case 6063:
+		return 30, true
+	case 6064:
+		return 45, true
+	case 6065:
+		return 60, true
+	}
+	return 0, false
+}
+
+type EpicEntryCommand struct {
+	Activity                           *dnfrepo.ActivityEvent
+	CharacterID, AccountID             string
+	DungeonID, ExpectedSequence, Nonce int64
+	Campaign                           *onlineevent.EpicCampaign
+	Alternatives                       [][]EntryItemRequirement
+	UpdatedAt                          time.Time
+	Project                            EntryItemProjector
+	Validate                           func() error
+	// Runs only for a new successful debit, inside the ticket/receipt transaction.
+	OnFatigueDebit func(*dnfrepo.CharacterRecord, int64, time.Time) error
+}
+type EpicEntryResult struct {
+	FatigueSpent int64
+	Character    dnfrepo.CharacterRecord
+	Consumed     []EntryItemConsumedStack
+	Replay       bool
+}
+
+// ConsumeEpicEntry keeps current FP1 behavior. It does not interpret the PVF
+// 'use fatigue only start dungeon' payload as a new fatigue policy.
+func (o *Owner) ConsumeEpicEntry(ctx context.Context, cmd EpicEntryCommand) (EpicEntryResult, error) {
+	result := EpicEntryResult{}
+	count, ok := EpicEntryTicketCount(cmd.DungeonID)
+	if o == nil || o.assets == nil || !ok || strings.TrimSpace(cmd.CharacterID) == "" || strings.TrimSpace(cmd.AccountID) == "" || cmd.ExpectedSequence < 0 || cmd.ExpectedSequence == math.MaxInt64 || cmd.Nonce <= 0 || cmd.UpdatedAt.IsZero() {
+		return result, ErrEntryItemConsumeInvalid
+	}
+	ctx = contextOrBackground(ctx)
+	err := o.assets.WithinCharacterAssets(ctx, cmd.CharacterID, func(chars dnfrepo.CharacterRepository, bags dnfrepo.InventoryRepository, _ dnfrepo.EquipmentRepository) error {
+		if cmd.Validate != nil {
+			if err := cmd.Validate(); err != nil {
+				return err
+			}
+		}
+		c, found, err := chars.Load(ctx, cmd.CharacterID)
+		if err != nil {
+			return err
+		}
+		if !found || c.CharacterID != cmd.CharacterID || c.AccountID != cmd.AccountID {
+			return fmt.Errorf("%w: epic character owner", ErrEntryItemConsumeInvalid)
+		}
+		c = dnfrepo.CloneCharacter(c)
+		seq := c.Stats[EpicEntrySequenceKey]
+		if seq == cmd.ExpectedSequence+1 && c.Stats[epicEntryNonceKey] == cmd.Nonce && c.Stats[epicEntryDungeonKey] == cmd.DungeonID {
+			result.Character = c
+			result.Replay = true
+			result.FatigueSpent = 1
+			return nil
+		}
+		if seq != cmd.ExpectedSequence {
+			return fmt.Errorf("%w: stale epic entry receipt", ErrEntryItemConsumeInvalid)
+		}
+		if c.Level < 85 {
+			return ErrEntryLevelTooLow
+		}
+		if fp, known := c.Stats["fatigue"]; !known || fp <= 0 {
+			return ErrEntryFatigueExhausted
+		}
+		v, found, err := bags.Load(ctx, cmd.CharacterID)
+		if err != nil {
+			return err
+		}
+		if !found || v.CharacterID != cmd.CharacterID {
+			return ErrEntryItemConsumeInsufficient
+		}
+		v = dnfrepo.CloneInventory(v)
+		alternatives := cmd.Alternatives
+		if len(alternatives) == 0 {
+			alternatives = [][]EntryItemRequirement{{{ItemID: 3330, Count: count, ConsumeOnEntry: true}}}
+		}
+		consumed, err := consumeEpicEntryItems(&v, alternatives, cmd.UpdatedAt, cmd.Project)
+		if err != nil {
+			return err
+		}
+		v.UpdatedAt = cmd.UpdatedAt
+		if err = dnfrepo.SaveInventoryFields(ctx, bags, v, dnfrepo.InventoryFieldSlots); err != nil {
+			return err
+		}
+		var invitations int64
+		for _, item := range consumed {
+			if item.ItemID == 3330 {
+				invitations += item.Count
+			}
+		}
+		if cmd.Campaign != nil && invitations > 0 {
+			if err = onlineevent.AccumulateEpicInvitations(&c, *cmd.Campaign, cmd.UpdatedAt, invitations); err != nil {
+				return err
+			}
+		}
+		beforeFatigue := c.Stats["fatigue"]
+		dnffatigue.Debit(&c)
+		result.FatigueSpent = max(int64(0), beforeFatigue-c.Stats["fatigue"])
+		if result.FatigueSpent > 0 && cmd.OnFatigueDebit != nil {
+			if err = cmd.OnFatigueDebit(&c, result.FatigueSpent, cmd.UpdatedAt); err != nil {
+				return err
+			}
+		}
+		if cmd.Activity != nil && beforeFatigue > c.Stats["fatigue"] {
+			event := *cmd.Activity
+			event.Amount = beforeFatigue - c.Stats["fatigue"]
+			if event.AccountID != cmd.AccountID || event.CharacterID != cmd.CharacterID || event.DungeonID != cmd.DungeonID || event.Metric != dnfrepo.ActivityFatigue || event.Source != "epic_entry" {
+				return dnfrepo.ErrActivityInvalid
+			}
+			added, err := dnfrepo.RecordCharacterActivity(ctx, chars, event)
+			if err != nil {
+				return err
+			}
+			if !added {
+				return dnfrepo.ErrActivityConflict
+			}
+		}
+		c.Stats[EpicEntrySequenceKey] = cmd.ExpectedSequence + 1
+		c.Stats[epicEntryNonceKey] = cmd.Nonce
+		c.Stats[epicEntryDungeonKey] = cmd.DungeonID
+		c.UpdatedAt = cmd.UpdatedAt
+		if err = dnfrepo.SaveCharacterFields(ctx, chars, c, dnfrepo.CharacterFieldStats); err != nil {
+			return err
+		}
+		if cmd.Validate != nil {
+			if err = cmd.Validate(); err != nil {
+				return err
+			}
+		}
+		result.Character = c
+		result.Consumed = consumed
+		return nil
+	})
+	if err != nil {
+		return EpicEntryResult{}, err
+	}
+	return result, nil
+}

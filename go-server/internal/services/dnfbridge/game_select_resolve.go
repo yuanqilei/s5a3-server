@@ -1,0 +1,232 @@
+package dnfbridge
+
+import (
+	"context"
+	"strconv"
+	"time"
+
+	dnfcharacterdata "longheng.io/server/internal/modules/dnf/characterdata"
+	dnfrepo "longheng.io/server/internal/modules/dnf/repository"
+)
+
+func (s *Service) resolveSelectedCharacter(
+	ctx context.Context,
+	session *gameSession,
+	request []byte,
+) (uint16, string, dnfrepo.CharacterRecord, bool, int) {
+	// Only the selecting session owner updates diagnostic identity. Peer profile
+	// reads through characterForEnter must remain read-only for that session.
+	session.launcherCharacterID, session.launcherCharacterName = 0, ""
+	parsed := parseSelectCharacterRequest(request)
+	slot := parsed.slot
+	// Channel changes open a new TCP session but retain the client's compact op2
+	// vector. Restore only the roster from this authenticated login flow. A cache
+	// miss must never reinterpret a compact index as an occupied SQL slot.
+	if s.options.currentClientVersion == "official-24.9" && session.channelReconnect && parsed.source == "legacy_slot_or_char_id" && len(session.currentRenameRoster) == 0 {
+		server := s.channelServerID()
+		if server > 0 && server <= 255 {
+			session.currentRenameRoster = s.cachedCurrentTagTournamentSentRoster(session, byte(server))
+		}
+		if len(session.currentRenameRoster) == 0 {
+			s.logGameEvent(session, "game-channel-select-roster-missing", "request_index", slot)
+			return 0, "", dnfrepo.CharacterRecord{}, false, slot
+		}
+	}
+	if !parsed.clear && len(request) > 0 {
+		s.logGameEvent(session, "game-upper-select-character-request-opaque",
+			"body_len", len(request),
+			"parsed_slot", slot,
+			"source", parsed.source)
+	} else if parsed.source == "nopack_key4_slot" || parsed.source == "nopack_plain_slot" {
+		s.logGameEvent(session, "game-upper-select-character-request-decoded",
+			"body_len", len(request),
+			"slot", slot,
+			"source", parsed.source)
+	}
+	if repos, ok := s.repositoryGroup(); ok && repos.Character != nil {
+		readStarted := time.Now()
+		characters, err := characterSelectionIdentities(ctx, repos.Character, s.accountIDForSession(session))
+		noteSelectReadTiming(session, "identity", readStarted)
+		if err != nil {
+			s.logGameEvent(session, "game-upper-select-character-list-failed", "slot", slot, "error", err)
+		} else if len(characters) > 0 {
+			if selected, selectedBy, ok := selectCharacterRecord(characters, session.currentRenameRoster, parsed); ok {
+				if selected.AccountID != s.accountIDForSession(session) || numericCharacterID(selected) <= 0 || numericCharacterID(selected) > 65535 {
+					return 0, "", dnfrepo.CharacterRecord{}, false, slot
+				}
+				if err := s.admitCharacterForEdits(ctx, session, selected.AccountID, uint16(numericCharacterID(selected))); err != nil {
+					s.logGameEvent(session, "game-character-edit-admission-failed", "error", err)
+					return 0, "", dnfrepo.CharacterRecord{}, false, slot
+				}
+				// Always reload after GM admission; the narrow identity is not a gameplay snapshot.
+				readStarted = time.Now()
+				selected, valid := loadSelectedCharacterIdentity(ctx, repos.Character, selected, s.accountIDForSession(session))
+				noteSelectReadTiming(session, "selected", readStarted)
+				if !valid {
+					return 0, "", dnfrepo.CharacterRecord{}, false, slot
+				}
+				if repos.Equipment != nil {
+					readStarted = time.Now()
+					s.attachEquipmentSummary(ctx, repos, &selected)
+					noteSelectReadTiming(session, "initialization", readStarted)
+				}
+				// selected is already a complete, ownership-checked record.
+				if stats, ok := s.characterPVFStatsForUserInfo(ctx, session, selected, true); ok {
+					needsRepair := characterPVFStatsNeedRepair(selected, stats)
+					applyCharacterPVFStats(&selected, stats)
+					if needsRepair {
+						if err := repairSelectedCharacterPVFStats(ctx, repos.Character, selected); err != nil {
+							s.logGameEvent(session, "game-upper-select-character-stat-repair-failed",
+								"character_id", selected.CharacterID,
+								"level", selected.Level,
+								"error", err)
+						}
+					}
+				}
+				charID := uint16(numericCharacterID(selected))
+				if charID == 0 {
+					charID = 1
+				}
+				session.launcherCharacterID = charID
+				session.launcherCharacterName = selected.Name
+				charName := selected.Name
+				if charName == "" {
+					charName = csharpSelectCharacterName(charID)
+				}
+				s.logGameEvent(session, "game-upper-select-character-resolved",
+					"request_slot", slot,
+					"record_slot", selected.Slot,
+					"char_id", charID,
+					"char_name", charName,
+					"job", selected.Job,
+					"level", selected.Level,
+					"source", parsed.source,
+					"selected_by", selectedBy,
+					"count", len(characters))
+				return charID, charName, selected, true, selected.Slot
+			}
+			s.logGameEvent(session, "game-upper-select-character-unresolved",
+				"request_slot", slot,
+				"source", parsed.source,
+				"count", len(characters),
+				"reason", "no_verified_slot_or_char_id")
+		}
+	}
+
+	charID := parsed.charID
+	return charID, csharpSelectCharacterName(charID), dnfrepo.CharacterRecord{}, false, slot
+}
+
+func selectCharacterRecord(
+	characters []dnfrepo.CharacterRecord,
+	sentRoster []dnfrepo.CharacterRecord,
+	parsed selectCharacterRequest,
+) (dnfrepo.CharacterRecord, string, bool) {
+	// The current two-byte selector addresses the row actually sent to this
+	// connection. Once that binding exists, an invalid or stale row must not
+	// fall back to a different SQL slot or numerically equal character ID.
+	if parsed.source == "legacy_slot_or_char_id" && len(sentRoster) > 0 {
+		if parsed.slot < 0 || parsed.slot >= len(sentRoster) {
+			return dnfrepo.CharacterRecord{}, "", false
+		}
+		row := sentRoster[parsed.slot]
+		for _, character := range characters {
+			if character.CharacterID == row.CharacterID &&
+				character.AccountID == row.AccountID &&
+				character.Slot == row.Slot {
+				return character, "roster_index", true
+			}
+		}
+		return dnfrepo.CharacterRecord{}, "", false
+	}
+	if selectRequestHasAuthoritativeCharID(parsed) {
+		for _, character := range characters {
+			if numericCharacterID(character) == int(parsed.charID) {
+				return character, "char_id", true
+			}
+		}
+		return dnfrepo.CharacterRecord{}, "", false
+	}
+	if parsed.slot >= 0 && parsed.slot < defaultCharacterSlots {
+		for _, character := range characters {
+			if character.Slot == parsed.slot {
+				return character, "slot", true
+			}
+		}
+	}
+	if parsed.source == "legacy_slot_or_char_id" && parsed.charID != 0 {
+		for _, character := range characters {
+			if numericCharacterID(character) == int(parsed.charID) {
+				return character, "char_id", true
+			}
+		}
+	}
+	return dnfrepo.CharacterRecord{}, "", false
+}
+
+func selectRequestHasAuthoritativeCharID(parsed selectCharacterRequest) bool {
+	switch parsed.source {
+	case "latest_type3", "legacy_char_id":
+		return parsed.charID != 0
+	default:
+		return false
+	}
+}
+
+func csharpSelectCharacterName(charID uint16) string {
+	if charID == 0 {
+		return ""
+	}
+	return "dnf_" + strconv.Itoa(int(charID))
+}
+
+func (s *Service) selectedCharacterForEnter(
+	ctx context.Context,
+	session *gameSession,
+) (uint16, string, dnfrepo.CharacterRecord, bool) {
+	if session == nil {
+		return 0, "", dnfrepo.CharacterRecord{}, false
+	}
+	return s.characterForEnter(ctx, session, session.selectedCharacterID)
+}
+
+func (s *Service) characterForEnter(
+	ctx context.Context,
+	session *gameSession,
+	characterID uint16,
+) (uint16, string, dnfrepo.CharacterRecord, bool) {
+	if repos, ok := s.repositoryGroupFor(ctx); ok && repos.Character != nil {
+		if characterID != 0 {
+			characterKey := strconv.Itoa(int(characterID))
+			aggregate, found, err := dnfcharacterdata.NewLoader(repos).Load(ctx, characterKey, dnfcharacterdata.PartEquipment)
+			if err != nil {
+				s.logGameEvent(session, "game-upper-enter-select-dungeon-aggregate-load-failed", "character_id", characterID, "error", err)
+			} else if found {
+				loaded := aggregate.Character
+				if aggregate.Presence.Equipment {
+					if summary := equipmentRosterSummary(aggregate.Equipment); len(summary) > 0 {
+						loaded.Roster.Entry.EquipSummary = summary
+					}
+				}
+				s.attachEquipmentSummary(ctx, repos, &loaded)
+				charName := loaded.Name
+				if charName == "" {
+					charName = csharpSelectCharacterName(characterID)
+				}
+				return characterID, charName, loaded, true
+			}
+			loaded, found, err := repos.Character.Load(ctx, characterKey)
+			if err != nil {
+				s.logGameEvent(session, "game-upper-enter-select-dungeon-load-failed", "character_id", characterID, "error", err)
+			} else if found {
+				s.attachEquipmentSummary(ctx, repos, &loaded)
+				charName := loaded.Name
+				if charName == "" {
+					charName = csharpSelectCharacterName(characterID)
+				}
+				return characterID, charName, loaded, true
+			}
+		}
+	}
+	return characterID, csharpSelectCharacterName(characterID), dnfrepo.CharacterRecord{}, false
+}

@@ -1,0 +1,218 @@
+package dnfbridge
+
+import (
+	"context"
+	"errors"
+	"io"
+	"time"
+)
+
+// A congested game stream needs more recovery time than a storage operation.
+// Keep this independent of createWriteTimeout: increasing database lock and
+// transaction deadlines would amplify peak-load pressure. The bound still
+// releases a peer that has stopped consuming data entirely.
+const gameTransportWriteTimeout = 30 * time.Second
+
+// Fixed metadata only. Buffered batches and provider controls deliberately
+// have no attributed inner opcode; never guess from encrypted wire bytes.
+type gameWritePacketDiagnostic struct {
+	known      bool
+	class      byte
+	msgID      uint16
+	innerBytes int
+}
+
+// Transport cancellation is separate from the event/transaction lifetime.
+// Retiring an account must still wait for its owner to finish committing.
+func (p *gameSession) gameTransportContext() context.Context {
+	p.transportOnce.Do(func() {
+		parent := p.ctx
+		if parent == nil {
+			parent = context.Background()
+		}
+		p.transportCtx, p.transportCancel = context.WithCancel(parent)
+	})
+	return p.transportCtx
+}
+
+func (p *gameSession) stopGameTransport() {
+	if p == nil {
+		return
+	}
+	p.gameTransportContext()
+	p.transportCancel()
+}
+
+func (p *gameSession) closeGameTransport() {
+	if p == nil {
+		return
+	}
+	p.stopGameTransport()
+	p.transportCloseOnce.Do(func() {
+		if p.conn != nil {
+			_ = p.conn.Close()
+		}
+	})
+}
+
+// Combine explicit caller cancellation, the connection lifetime and the
+// default upper bound. No context here is used to cancel an asset transaction.
+func gameTransportBudget(p *gameSession, parent context.Context) (context.Context, context.CancelFunc) {
+	lifetime := p.gameTransportContext()
+	if parent == nil || parent == context.Background() || parent == lifetime {
+		return context.WithTimeout(lifetime, gameTransportWriteTimeout)
+	}
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(parent, gameTransportWriteTimeout)
+	stop := context.AfterFunc(lifetime, cancel)
+	if lifetime.Err() != nil {
+		cancel()
+	}
+	return ctx, func() { stop(); cancel() }
+}
+
+func (s *Service) lockGameWire(p *gameSession, parent context.Context) error {
+	if parent != nil && parent.Err() != nil {
+		return parent.Err()
+	}
+	if err := p.gameTransportContext().Err(); err != nil {
+		return err
+	}
+	started := s.performanceStart()
+	if p.wireMu.TryLock() {
+		s.performanceEnd(perfWireLock, started, nil)
+		return nil
+	}
+	ctx, cancel := gameTransportBudget(p, parent)
+	defer cancel()
+	err := lockCurrentCrossSceneProfile(ctx, &p.wireMu)
+	s.performanceEnd(perfWireLock, started, err)
+	return err
+}
+
+// Caller holds wireMu. The scope is logical: buffering is not a socket write.
+// Nested scopes inherit the earlier deadline and cancellation; on exit the
+// parent is restored. Only the actual write owns a socket deadline/callback.
+func beginGameWriteBudgetLocked(p *gameSession, parent context.Context) (func(), error) {
+	previous := p.wireWriteContext
+	if previous != nil && (parent == nil || parent.Done() == nil || parent == previous) {
+		if err := previous.Err(); err != nil {
+			return nil, err
+		}
+		return func() {}, nil
+	}
+	ctx, cancel := gameTransportBudget(p, parent)
+	var stop func() bool
+	if previous != nil {
+		deadline, ok := previous.Deadline()
+		current, hasDeadline := ctx.Deadline()
+		if ok && (!hasDeadline || deadline.Before(current)) {
+			var childCancel context.CancelFunc
+			ctx, childCancel = context.WithDeadline(ctx, deadline)
+			oldCancel := cancel
+			cancel = func() { childCancel(); oldCancel() }
+		}
+		stop = context.AfterFunc(previous, cancel)
+		if previous.Err() != nil {
+			cancel()
+		}
+	}
+	finish := func() {
+		if stop != nil {
+			stop()
+		}
+		cancel()
+		p.wireWriteContext = previous
+	}
+	if err := ctx.Err(); err != nil {
+		finish()
+		return nil, err
+	}
+	p.wireWriteContext = ctx
+	return finish, nil
+}
+
+// All game TCP writes, including provider controls and batch flushes, pass
+// here under wireMu. A short write cannot reuse an advanced codec sequence.
+func (s *Service) writeGameSessionObserved(p *gameSession, data []byte, stage int) (int, error) {
+	if p.wireWriteContext == nil {
+		finish, err := beginGameWriteBudgetLocked(p, nil)
+		if err != nil {
+			s.logFirstGameTransportFailure(p, "budget_setup", stage, len(data), 0, 0, nil)
+			p.closeGameTransport()
+			return 0, err
+		}
+		defer finish()
+	}
+	ctx := p.wireWriteContext
+	if err := ctx.Err(); err != nil {
+		s.logFirstGameTransportFailure(p, "before_socket_write", stage, len(data), 0, 0, ctx)
+		p.closeGameTransport() // The caller may already have encoded this frame.
+		return 0, err
+	}
+	deadline, _ := ctx.Deadline()
+	if err := p.conn.SetWriteDeadline(deadline); err != nil {
+		s.logFirstGameTransportFailure(p, "set_write_deadline", stage, len(data), 0, 0, ctx)
+		p.closeGameTransport()
+		return 0, err
+	}
+	finished := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		_ = p.conn.SetWriteDeadline(time.Now())
+		close(finished)
+	})
+	defer func() {
+		if !stop() {
+			<-finished
+		}
+		if err := p.conn.SetWriteDeadline(time.Time{}); err != nil {
+			s.logFirstGameTransportFailure(p, "clear_write_deadline", stage, len(data), 0, 0, ctx)
+			p.closeGameTransport()
+		}
+	}()
+	writeStarted := time.Now()
+	n, err := s.writeGameConnectionObserved(p.conn, data, stage)
+	if err == nil && n != len(data) {
+		err = io.ErrShortWrite
+	}
+	if err != nil {
+		s.logFirstGameTransportFailure(p, "socket_write", stage, len(data), n, time.Since(writeStarted), ctx)
+		// Keep the established zero-byte, non-timeout retry contract. A partial
+		// frame or expired write can no longer safely reuse this stream.
+		// Do not call arbitrary error Unwrap/Timeout methods here: preserve
+		// even typed-nil provider errors for the caller's diagnostic owner.
+		if p.dproto != nil || n > 0 || err == io.ErrShortWrite || ctx.Err() != nil || !time.Now().Before(deadline) {
+			p.closeGameTransport()
+		}
+		if ctx.Err() != nil {
+			err = errors.Join(err, ctx.Err())
+		}
+	}
+	return n, err
+}
+
+// Keep the initiating write failure even when packet logs are disabled. Later
+// context-canceled errors from queued work must not replace this evidence.
+// Do not format provider errors, payloads or account data here.
+func (s *Service) logFirstGameTransportFailure(p *gameSession, phase string, stage, planned, written int, elapsed time.Duration, ctx context.Context) {
+	p.transportFailureOnce.Do(func() {
+		budget := "unavailable"
+		if ctx != nil {
+			budget = "active"
+			if ctx.Err() == context.Canceled {
+				budget = "canceled"
+			} else if deadline, ok := ctx.Deadline(); ctx.Err() == context.DeadlineExceeded || ok && !time.Now().Before(deadline) {
+				budget = "deadline_exceeded"
+			}
+		}
+		fields := []any{"conn_id", p.connID,
+			"phase", phase, "write_stage", stage, "planned_bytes", planned,
+			"written_bytes", written, "write_us", elapsed.Microseconds(), "budget_state", budget}
+		if packet := p.wireWritePacket; stage == perfWireDirect && packet.known {
+			fields = append(fields, "inner_msg_id", packet.msgID, "inner_class", packet.class, "inner_bytes", packet.innerBytes)
+		}
+		s.logWarn("dnfbridge first game transport failure", fields...)
+	})
+}

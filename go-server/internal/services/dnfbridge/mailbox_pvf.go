@@ -1,0 +1,402 @@
+package dnfbridge
+
+import (
+	"bytes"
+	"encoding/binary"
+	"encoding/hex"
+	"fmt"
+	"strconv"
+	"strings"
+	"time"
+
+	"longheng.io/server/internal/modules/dnf/alignedcmd"
+	"longheng.io/server/internal/modules/dnf/dnfenum"
+	"longheng.io/server/internal/modules/dnf/itemexpiration"
+	dnfrepo "longheng.io/server/internal/modules/dnf/repository"
+)
+
+func (s *Service) alignedMailboxItemResolverForCommand(opcode dnfenum.CmdPacket) (alignedcmd.MailboxItemResolver, error) {
+	needsPrice := opcode == dnfenum.CmdPacketMailboxSend || opcode == dnfenum.CmdPacketMultiMailboxSend
+	needsPVFType := opcode == dnfenum.CmdPacketMailboxOpen ||
+		opcode == dnfenum.CmdPacketMailboxExtractItem ||
+		opcode == dnfenum.CmdPacketChangeLetterStat
+	if !needsPrice && !needsPVFType {
+		return nil, nil
+	}
+	// 只有领取（op95）才会把附件落成实例：装备/时装要在这一刻拿到 quality_seed
+	// （实例身份）。发送（op94/op315）不落地实例，就不做无意义的种子生成。
+	claiming := opcode == dnfenum.CmdPacketMailboxExtractItem
+	catalog, err := s.currentPVFItemCatalog()
+	if err != nil {
+		// Keep the failing resolver non-nil. The mailbox handler must see that
+		// the authoritative item type is unavailable and suppress the 0x61
+		// projection, rather than falling back to mutable historical Extra.
+		catalogErr := err
+		return func(itemID uint32) (alignedcmd.MailboxItemResolution, error) {
+			return alignedcmd.MailboxItemResolution{}, fmt.Errorf("mailbox item=%d runtime PVF unavailable: %w", itemID, catalogErr)
+		}, err
+	}
+	return func(itemID uint32) (alignedcmd.MailboxItemResolution, error) {
+		definition, resolveErr := catalog.ResolveItem(itemID)
+		if resolveErr != nil {
+			return alignedcmd.MailboxItemResolution{}, resolveErr
+		}
+		resolution, err := mailboxItemResolutionFromPVF(definition, needsPrice)
+		if err != nil {
+			return resolution, err
+		}
+		if claiming {
+			// 见 currentMailAttachmentQualitySeedExtra：缺了它，领出来的装备
+			// 在 op19 穿上时会因为"raw 行重建失败"被静默拒绝（重登脱落）。
+			projected, seedErr := currentMailAttachmentQualitySeedExtra(resolution.DefaultExtra, definition)
+			if seedErr != nil {
+				return alignedcmd.MailboxItemResolution{}, fmt.Errorf("mailbox claim item=%d quality seed: %w", itemID, seedErr)
+			}
+			resolution.DefaultExtra = projected
+		}
+		if listType, slotStart, slotEnd, socketData, isAvatar := currentMailboxAvatarResolution(catalog, definition); isAvatar {
+			resolution.TargetListType = listType
+			resolution.SlotStart = slotStart
+			resolution.SlotEnd = slotEnd
+			resolution.StackLimit = 1
+			resolution.AvatarSocketData = socketData
+		}
+		if claiming && s.epicPieceGrantEnabled() {
+			// 史诗碎片（`etc/epicpieceinfo.etc [piece list]` 的成员，真档 966 条）：
+			// 标上 EpicPieceID 之后 mail 模块不写任何背包行，改记账号级图鉴账本。
+			// 只在领取期、且两个开关都在 on 档时置位；否则为零 ⇒ 附件照旧堆进
+			// 材料页，逐字节等于改动前。见 epic_piece_grant.go 文件头（含现场
+			// 封包 hex 与真档依据）。
+			if pieceID, isPiece := epicPieceCreditTarget(s, itemID); isPiece {
+				resolution.EpicPieceID = pieceID
+			}
+		}
+		if claiming && s.cubeWarehouseRoutingEnabled() {
+			// 小晶块/灵魂一律进账号晶块仓库的固定格（354..365），不进主背包材料页。
+			// 判据是 dnfrepo.AccountWarehouseSlotForItem（唯一映射）；回退档或映射
+			// 未命中时字段为零 ⇒ 附件照旧入包，逐字节等于改动前。
+			// 现场与证据见 cube_warehouse_routing.go 文件头。
+			if slot, isCube := dnfrepo.AccountWarehouseSlotForItem(int64(itemID)); isCube {
+				resolution.AccountWarehouseSlot = slot
+			}
+		}
+		return resolution, nil
+	}, nil
+}
+
+// currentMailboxAvatarResolution 处理装扮类附件：目标容器是装扮栏(list 1)，
+// 皮肤/光环还要带上它们按运行时 PVF 声明的创建期徽章孔向量。
+// 附件本身只带 itemID（GM 面板邮件就是这么发的），所以这两件事都必须在领取端
+// 补齐，否则玩家收到的时装既不在装扮栏、也没有徽章孔。
+func currentMailboxAvatarResolution(
+	catalog *pvfDungeonDropCatalog,
+	definition dungeonDropItemDefinition,
+) (byte, int16, int16, []byte, bool) {
+	if catalog == nil || catalog.source == nil || definition.Kind != dungeonDropItemEquipment {
+		return 0, 0, 0, nil, false
+	}
+	document, err := parseDungeonCardPVFDocument(catalog.source, definition.PVFPath)
+	if err != nil {
+		return 0, 0, 0, nil, false
+	}
+	equipmentType, found := document.Text("equipment type")
+	if !found {
+		return 0, 0, 0, nil, false
+	}
+	rule, ok := currentEquipmentPlacementRuleForPVFType(equipmentType)
+	if !ok || rule.class != currentEquipmentPlacementClassAvatar {
+		return 0, 0, 0, nil, false
+	}
+	const (
+		mailboxAvatarSlotStart int16 = 0
+		mailboxAvatarSlotEnd   int16 = 500
+	)
+	var socketData []byte
+	if socketTypes := currentAvatarCreationSocketTypes(catalog.source, definition.PVFPath, rule); len(socketTypes) > 0 {
+		// 皮肤([skin avatar])与光环([aurora avatar])按运行时 PVF 声明天生带孔
+		// （皮肤是 [avatar emblem socket num] 2，光环是 [emblem socket default]）；
+		// 普通时装部位不预开孔。孔位向量由装扮栏 list 1 的可选 blob 承载，所以这
+		// 里只交给领取路径写进堆栈 Extra，不能烘进固定行。
+		var data [currentAvatarSocketBytes]byte
+		currentSetAvatarSocketTypes(&data, socketTypes)
+		socketData = append([]byte(nil), data[:]...)
+	}
+	return 1, mailboxAvatarSlotStart, mailboxAvatarSlotEnd, socketData, true
+}
+
+func mailboxItemResolutionFromPVF(definition dungeonDropItemDefinition, needsPrice bool) (alignedcmd.MailboxItemResolution, error) {
+	// A listed, successfully parsed PVF item remains authoritative even when
+	// its document omits [price]. The current composer accepts those items and
+	// displays only the fixed attachment postage, so an absent price contributes
+	// zero value instead of invalidating the durable attachment.
+	if needsPrice && definition.Price < 0 {
+		return alignedcmd.MailboxItemResolution{}, fmt.Errorf("mailbox item %d has invalid negative runtime-PVF price", definition.ItemID)
+	}
+	stackLimit := definition.StackLimit
+	policy := currentPVFItemPlacementPolicy(definition).ForGrant()
+	if definition.Kind == dungeonDropItemEquipment {
+		stackLimit = 1
+	}
+	equipmentType := strings.TrimSpace(definition.EquipmentType)
+	if equipmentType == "" && definition.Kind == dungeonDropItemStackable &&
+		normalizeDungeonDropStackableType(definition.StackableType) == "[creature]" {
+		// [creature] pet rename cards take the client's type-26 branch, whose
+		// row-width discriminator is stored in [stackable type]. Expose that
+		// authoritative token without assigning other stackable families to the
+		// equipment-type field used by the 0x61 projection.
+		equipmentType = strings.TrimSpace(definition.StackableType)
+	}
+	resolution := alignedcmd.MailboxItemResolution{
+		Price:           definition.Price,
+		PVFPath:         definition.PVFPath,
+		Kind:            string(definition.Kind),
+		EquipmentType:   equipmentType,
+		SlotStart:       definition.SlotStart,
+		SlotEnd:         definition.SlotEnd,
+		StackLimit:      stackLimit,
+		PreferQuickSlot: policy.PreferQuickSlots,
+		AllowQuickSlots: policy.AllowQuickSlots,
+	}
+	if definition.Kind == dungeonDropItemStackable && !definition.DailyDeleteItem {
+		resolution.UsablePeriodDays = definition.UsablePeriodDays
+		if resolution.UsablePeriodDays > 0 {
+			resolution.OriginalExpiry = currentMailboxOriginalAttachmentExpiry
+		}
+	}
+	// 附件行本身可能没有实例到期时间（GM 面板发的邮件就是这样）。当前客户端把
+	// "到期时间为 0"渲染成"已超过使用期限"，所以这里按运行时 PVF 先算好创建期
+	// 到期投影，领取时由 mail 模块补进堆栈（附件已经带了到期时间时不覆盖）。
+	//
+	// 投影必须先过 currentPVFItemDefinitionForGrantAt：一整批"完成类型"券在运行时
+	// PVF 里只声明了相对 [usable period]、没有绝对 [expiration date]
+	// （Lv1~90主线任务完成券 10164630 = stackable/10164001/10164630.stk、
+	//  Lv1~90主线/成就任务完成券 10301410 = stackable/10301001/10301410.stk，
+	// 两者都是 [stackable type] `[etc]` + [usable period] 1），
+	// 只看 definition.ExpirationDate 会把它们当成"永久"，投影整个落空。
+	// 该 helper 是仓库既有的发放期口径：相对期限在这里（实例创建时刻）解析一次，
+	// 绝对日期原样返回，所以两条声明都不会漏。
+	grantAt := time.Now().UTC()
+	grantDefinition, grantErr := currentPVFItemDefinitionForGrantAt(definition, grantAt)
+	if grantErr != nil {
+		return alignedcmd.MailboxItemResolution{}, fmt.Errorf("mailbox claim item=%d usable period: %w", definition.ItemID, grantErr)
+	}
+	if grantDefinition.Kind == dungeonDropItemStackable && !grantDefinition.ExpirationDate.IsZero() {
+		projected, _ := applyCurrentPVFItemExpirationAt(
+			dnfrepo.ItemStack{ItemID: int64(grantDefinition.ItemID), Count: 1},
+			grantDefinition,
+			grantAt,
+		)
+		resolution.ExpireAt = projected.ExpireAt
+		if len(projected.Extra) > 0 {
+			resolution.DefaultExtra = projected.Extra
+		}
+	}
+	// 到期投影只负责"有到期日"的道具（`applyCurrentPVFItemExpirationAt` 在没有
+	// [expiration date] 时直接返回），所以身份信息必须单独补：官方发放路径
+	// （点券套餐/商城/盒子）都会给堆栈写 item_kind/pvf_path/stackable_type，而 GM 面板
+	// 邮件没有附件 Extra。宠物更名卡的改名校验（pet.isCurrentPetRenameCard）正是按
+	// pvf_path + stackable_type 判定的——缺了它，领出来的卡"看得见、改不了名"。
+	resolution.DefaultExtra = mergeMailboxItemIdentityExtra(resolution.DefaultExtra, definition)
+	// 装备/时装类附件的耐久证据同样要在领取端补齐：GM 面板邮件没有附件 Extra，
+	// 于是领出来的装备既显示 0 耐久、也修不了（修理路径要求 durability +
+	// max_durability，缺证据就失败关闭）。真源是运行时 PVF 的 [durability]。
+	// 堆叠物没有耐久语义，helper 内部按 Kind 硬门禁，绝不写。
+	// 交付端在盘里旧邮件上也做同一次修补（reconcileCurrentMailAttachmentExpirations）。
+	resolution.DefaultExtra = mergeCurrentMailAttachmentDurabilityExtra(resolution.DefaultExtra, definition)
+	// Daily-delete equipment has no relative [usable period] and no absolute
+	// [expiration date]; its deadline belongs to each issued attachment. Keep
+	// the item-template defaults without a grant source, and let the claim
+	// owner calculate that evidence from the mail's trusted creation anchor.
+	resolution.ProjectAttachment = currentMailboxDailyEquipmentAttachmentProjector(definition)
+	// 宠物背包的合法槽位不在主背包里：[creature] 消耗品（宠物更名卡）与 [feed]
+	// 属于 list 7 的宠物消耗品段，[creature] 装备（宠物本体）属于 list 7 的
+	// 0..139。玩家期望（2026-09-24 现场确认）与 A21 参考实现一致：更名卡就该待在
+	// 宠物栏消耗品段；改名请求带的也是这一段里的槽位（见 pet/rename.go）。
+	//
+	// 判定不再各写一套：容器/分段一律问 currentPVFItemTargetContainer（唯一真源）。
+	container := currentPVFItemTargetContainer(definition)
+	switch {
+	case container.PetBody, container.PetArtifact:
+		// 宠物装备与宠物本体都属于 list 7，分别使用分类器给出的独立槽段。
+		// 遗漏 PetArtifact 会把原版及自定义红/蓝/绿宠装全部领到人物装备页。
+		resolution.TargetListType = container.ListType
+		resolution.SlotStart = container.SlotStart
+		resolution.SlotEnd = container.SlotEnd
+		resolution.StackLimit = 1
+		return resolution, nil
+	case container.PetConsumable:
+		resolution.TargetListType = container.ListType
+		resolution.SlotStart = container.SlotStart
+		resolution.SlotEnd = container.SlotEnd
+		return resolution, nil
+	case container.GuildMedal, container.GuardianGem:
+		// 公会勋章 / 公会守护珠的容器是 wire list 38（同一个 98 格容器的两个
+		// 49 格分页：勋章 0..48、守护珠 49..97）。现场报障「勋章获得时直接进
+		// 装备栏」「守护珠获得时直接进消耗品栏」都发生在领取期：解析出来的
+		// domain 默认是主背包页。这里与宠物段同样处理——容器/区间由
+		// currentPVFItemTargetContainer 给出，邮件模块只按 (list, slot) 落行。
+		resolution.TargetListType = container.ListType
+		resolution.SlotStart = container.SlotStart
+		resolution.SlotEnd = container.SlotEnd
+		if container.GuildMedal {
+			resolution.StackLimit = 1
+		}
+		return resolution, nil
+	}
+	return resolution, nil
+}
+
+// currentMailboxDailyEquipmentAttachmentProjector returns a per-attachment
+// resolver only for the narrowly catalogued daily-delete equipment shape. The
+// callback never performs I/O and never changes the item template's shared
+// DefaultExtra, because two attachments in one mail can have different ages.
+func currentMailboxDailyEquipmentAttachmentProjector(
+	definition dungeonDropItemDefinition,
+) alignedcmd.MailboxAttachmentProjector {
+	if definition.Kind != dungeonDropItemEquipment || !definition.DailyDeleteItem ||
+		definition.UsablePeriodDays > 0 || !definition.ExpirationDate.IsZero() {
+		return nil
+	}
+	return func(attachment dnfrepo.MailAttachment, anchor time.Time) (alignedcmd.MailboxAttachmentProjection, error) {
+		if attachment.ItemID != int64(definition.ItemID) {
+			return alignedcmd.MailboxAttachmentProjection{}, fmt.Errorf("daily equipment attachment template mismatch")
+		}
+		raw := attachment.RawEntry
+		rawHex, hasRawHex := attachment.Extra["raw_entry_hex"]
+		if hasRawHex {
+			if len(strings.TrimSpace(rawHex)) != 2*currentItemListEntryWireSize {
+				return alignedcmd.MailboxAttachmentProjection{}, fmt.Errorf("daily equipment attachment raw hex length invalid")
+			}
+			decoded, err := hex.DecodeString(strings.TrimSpace(rawHex))
+			if err != nil || len(decoded) != currentItemListEntryWireSize || binary.LittleEndian.Uint32(decoded[2:]) != uint32(attachment.ItemID) {
+				return alignedcmd.MailboxAttachmentProjection{}, fmt.Errorf("daily equipment attachment raw hex identity invalid")
+			}
+			// Both carriers describe the same durable instance. No proven
+			// projection contract permits differences, even outside expiry.
+			if len(raw) > 0 && !bytes.Equal(raw, decoded) {
+				return alignedcmd.MailboxAttachmentProjection{}, fmt.Errorf("daily equipment attachment raw carriers conflict")
+			}
+			if len(raw) == 0 {
+				raw = decoded
+			}
+		}
+		if len(raw) > 0 && (len(raw) != currentItemListEntryWireSize || binary.LittleEndian.Uint32(raw[2:]) != uint32(attachment.ItemID)) {
+			return alignedcmd.MailboxAttachmentProjection{}, fmt.Errorf("daily equipment attachment raw identity invalid")
+		}
+		// Explicit durable expiry is never replaced by a new grant projection.
+		if !attachment.ExpireAt.IsZero() {
+			return alignedcmd.MailboxAttachmentProjection{}, nil
+		}
+		existing := currentMailboxOriginalAttachmentExpiry(attachment)
+		if existing.IsZero() && len(raw) == currentItemListEntryWireSize {
+			if stamp := binary.LittleEndian.Uint32(raw[currentItemListExpireTimeOffset:]); stamp != 0 {
+				existing = time.Unix(int64(stamp), 0).UTC()
+			}
+		}
+		source := strings.TrimSpace(attachment.Extra["expiration_source"])
+		if !existing.IsZero() {
+			// Preserve an existing instance deadline and its provenance. A raw
+			// row can supply the instance timestamp without becoming a new
+			// daily-delete authorization.
+			return alignedcmd.MailboxAttachmentProjection{ExpireAt: existing}, nil
+		}
+		if source != "" {
+			// GM/rental and every other independently owned deadline remains
+			// untouched, including a GM marker without a readable deadline.
+			if source != currentPVFDailyEquipmentGrantSource {
+				return alignedcmd.MailboxAttachmentProjection{}, nil
+			}
+			return alignedcmd.MailboxAttachmentProjection{}, fmt.Errorf(
+				"daily equipment attachment item=%d has source but no deadline", attachment.ItemID)
+		}
+		// A raw row proves an existing instance, even when its expiry is zero.
+		// Preserve it without granting cleanup provenance or inferring its age.
+		if len(raw) > 0 || hasRawHex {
+			return alignedcmd.MailboxAttachmentProjection{}, nil
+		}
+		for _, key := range []string{"rental", "rental_item", "rental_expire_time", "rental_duration_hours", "gm_expire_days", "usable_period_days", "cera_shop_duration_days", "source", "last_grant_source"} {
+			if strings.TrimSpace(attachment.Extra[key]) != "" {
+				return alignedcmd.MailboxAttachmentProjection{}, nil
+			}
+		}
+		for _, key := range []string{"expire_time", "expire_unix", itemexpiration.DailyDeleteDeadlineKey} {
+			if strings.TrimSpace(attachment.Extra[key]) != "" {
+				return alignedcmd.MailboxAttachmentProjection{}, fmt.Errorf(
+					"daily equipment attachment item=%d has unreadable existing deadline %s", attachment.ItemID, key)
+			}
+		}
+		if anchor.IsZero() || anchor.Unix() <= 0 || anchor.Unix() > int64(^uint32(0)) {
+			return alignedcmd.MailboxAttachmentProjection{}, fmt.Errorf(
+				"daily equipment attachment item=%d has no trusted mail creation anchor", attachment.ItemID)
+		}
+		granted, err := currentPVFItemDefinitionForGrantAt(definition, anchor.UTC())
+		if err != nil {
+			return alignedcmd.MailboxAttachmentProjection{}, err
+		}
+		deadline := granted.ExpirationDate
+		if deadline.IsZero() {
+			return alignedcmd.MailboxAttachmentProjection{}, fmt.Errorf(
+				"daily equipment attachment item=%d has no deadline", attachment.ItemID)
+		}
+		unix := deadline.Unix()
+		if unix <= 0 || unix > int64(^uint32(0)) {
+			return alignedcmd.MailboxAttachmentProjection{}, fmt.Errorf(
+				"daily equipment attachment item=%d deadline out of range", attachment.ItemID)
+		}
+		local := deadline.In(currentPVFExpirationDateLocation)
+		if local.Hour() != 6 || local.Minute() != 0 || local.Second() != 0 || local.Nanosecond() != 0 {
+			return alignedcmd.MailboxAttachmentProjection{}, fmt.Errorf(
+				"daily equipment attachment item=%d deadline is not an 06:00 boundary", attachment.ItemID)
+		}
+		text := strconv.FormatInt(unix, 10)
+		return alignedcmd.MailboxAttachmentProjection{
+			ExpireAt: deadline.UTC(),
+			Extra: map[string]string{
+				"expiration_source":                   currentPVFDailyEquipmentGrantSource,
+				itemexpiration.DailyDeleteDeadlineKey: text,
+				"expire_time":                         text,
+				"expire_unix":                         text,
+			},
+		}, nil
+	}
+}
+
+// mergeMailboxItemIdentityExtra 把运行时 PVF 解析出的道具身份并入领取投影的
+// DefaultExtra（缺键才补，绝不覆盖附件自带的值）。
+func mergeMailboxItemIdentityExtra(
+	base map[string]string,
+	definition dungeonDropItemDefinition,
+) map[string]string {
+	identity := make(map[string]string, 4)
+	if definition.Kind != "" {
+		identity["item_kind"] = string(definition.Kind)
+	}
+	if pvfPath := strings.TrimSpace(definition.PVFPath); pvfPath != "" {
+		identity["pvf_path"] = pvfPath
+	}
+	// Persist the same positive PVF cap as dungeon/shop instance constructors.
+	// The claim allocator's StackLimit alone does not survive account-cargo moves.
+	if definition.Kind == dungeonDropItemStackable && definition.StackLimit > 0 {
+		identity["stack_limit"] = strconv.FormatInt(definition.StackLimit, 10)
+	}
+	if stackableType := strings.TrimSpace(definition.StackableType); stackableType != "" {
+		identity["stackable_type"] = stackableType
+	}
+	if definition.Kind == dungeonDropItemEquipment {
+		if equipmentType := strings.TrimSpace(definition.EquipmentType); equipmentType != "" {
+			identity["equipment_type"] = equipmentType
+		}
+	}
+	if len(identity) == 0 {
+		return base
+	}
+	if base == nil {
+		return identity
+	}
+	for key, value := range identity {
+		if _, exists := base[key]; !exists {
+			base[key] = value
+		}
+	}
+	return base
+}

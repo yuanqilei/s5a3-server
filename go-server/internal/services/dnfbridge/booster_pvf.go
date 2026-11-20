@@ -1,0 +1,709 @@
+package dnfbridge
+
+import (
+	cryptorand "crypto/rand"
+	"errors"
+	"fmt"
+	"math"
+	"math/big"
+	"sort"
+	"strings"
+	"time"
+
+	dnfpvf "longheng.io/server/internal/modules/dnf/pvf"
+	dnfrepo "longheng.io/server/internal/modules/dnf/repository"
+)
+
+// boosterDuplicateSelectionCategoryEnv 是"同一个 `[booster select category]` id
+// 出现多次"这一真档形状的读取档位开关。
+//
+//	未设置 / merge / 1 / true / on  = 合并（默认；第二个块的行追加进同一 category）
+//	reject / 0 / false / off / legacy = 一键回退到 2026-09-28 之前：整份文档判非法
+//	                                   （错误串 `duplicate booster selection category=<id>`）
+//
+// 只影响重复 category id 的读法，不改变任何其它 PVF 形状的接受与否。
+const (
+	boosterDuplicateSelectionCategoryEnv    = "DNFBRIDGE_BOOSTER_SELECT_CATEGORY_DUPLICATE"
+	boosterDuplicateSelectionCategoryReject = "reject"
+)
+
+func boosterDuplicateSelectionCategoryMergeEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(envString(boosterDuplicateSelectionCategoryEnv, ""))) {
+	case boosterDuplicateSelectionCategoryReject, "0", "false", "off", "no", "legacy":
+		return false
+	default:
+		return true
+	}
+}
+
+func resolveCurrentBoosterDefinition(
+	catalog *pvfDungeonDropCatalog,
+	sourceItemID uint32,
+	requestKind currentBoosterRequestKind,
+) (currentBoosterDefinition, error) {
+	return resolveCurrentBoosterDefinitionForCharacter(catalog, sourceItemID, requestKind, nil)
+}
+
+func resolveCurrentBoosterDefinitionForCharacter(
+	catalog *pvfDungeonDropCatalog,
+	sourceItemID uint32,
+	requestKind currentBoosterRequestKind,
+	character *dnfrepo.CharacterRecord,
+) (currentBoosterDefinition, error) {
+	if catalog == nil || catalog.source == nil || sourceItemID == 0 {
+		return currentBoosterDefinition{}, errCurrentBoosterPVFInvalid
+	}
+	sourceDefinition, err := catalog.ResolveItem(sourceItemID)
+	if err != nil {
+		return currentBoosterDefinition{}, fmt.Errorf("%w: resolve source item=%d: %v", errCurrentBoosterPVFInvalid, sourceItemID, err)
+	}
+	if sourceDefinition.Kind != dungeonDropItemStackable {
+		return currentBoosterDefinition{}, fmt.Errorf("%w: source item=%d is not stackable", errCurrentBoosterPVFInvalid, sourceItemID)
+	}
+	document, err := parseDungeonCardPVFDocument(catalog.source, sourceDefinition.PVFPath)
+	if err != nil {
+		return currentBoosterDefinition{}, fmt.Errorf("%w: read source item=%d: %v", errCurrentBoosterPVFInvalid, sourceItemID, err)
+	}
+	stackableType := normalizeDungeonDropStackableType(magicBoxDocumentText(document, "stackable type"))
+	definition := currentBoosterDefinition{Source: sourceDefinition, StackableType: stackableType}
+	definition.ItemUsage, err = resolveCurrentItemUsageDefinition(catalog, int64(sourceItemID))
+	if err != nil {
+		return currentBoosterDefinition{}, err
+	}
+	definition.LotteryGoldCost, _, err = currentLotteryOpeningGold(document)
+	if err != nil {
+		return currentBoosterDefinition{}, err
+	}
+	switch requestKind {
+	case currentBoosterRequestSelection:
+		if stackableType != "[booster selection]" {
+			return currentBoosterDefinition{}, fmt.Errorf("%w: source item=%d type=%q is not selectable", errCurrentBoosterPVFInvalid, sourceItemID, stackableType)
+		}
+		requiredValues := document.Ints("booster selection num")
+		if len(requiredValues) == 0 || requiredValues[0] < 0 || requiredValues[0] > currentBoosterMaxRewardRows {
+			return currentBoosterDefinition{}, fmt.Errorf("%w: source item=%d selection_num=%v", errCurrentBoosterPVFInvalid, sourceItemID, requiredValues)
+		}
+		definition.SelectionRequired = int(requiredValues[0])
+		definition.Selection, definition.SelectionCategory, err = parseCurrentBoosterSelectionCatalog(document)
+		if err != nil || currentBoosterSelectionHasEquipmentAttributes(definition.Selection) {
+			// Some native equipment-labelled choices actually award stackable
+			// tickets. Only their fully resolved, non-equipment rewards can
+			// safely use the ordinary grant projection without instance fields.
+			if rows, categories, compatible := parseCurrentBoosterStackableSelectionMetadata(catalog, document); compatible {
+				definition.Selection, definition.SelectionCategory, err = rows, categories, nil
+			}
+		}
+		if err != nil {
+			return currentBoosterDefinition{}, fmt.Errorf("%w: source item=%d: %v", errCurrentBoosterPVFInvalid, sourceItemID, err)
+		}
+		if len(definition.Selection) == 0 || len(definition.SelectionCategory) == 0 {
+			return currentBoosterDefinition{}, fmt.Errorf(
+				"%w: source item=%d selection_rows=%d selection_categories=%d",
+				errCurrentBoosterPVFInvalid,
+				sourceItemID,
+				len(definition.Selection),
+				len(definition.SelectionCategory),
+			)
+		}
+		definition.CompactArmorCategories = make(map[uint16]bool)
+		if definition.SelectionRequired == 0 {
+			for category, rows := range definition.SelectionCategory {
+				definition.CompactArmorCategories[category] = currentBoosterCompleteArmorCategory(catalog, rows)
+			}
+		}
+		for category, candidates := range definition.SelectionCategory {
+			defaults := 0
+			for _, candidate := range candidates {
+				if candidate.DefaultSelected {
+					defaults++
+				}
+			}
+			if definition.SelectionRequired > 0 && defaults > definition.SelectionRequired {
+				return currentBoosterDefinition{}, fmt.Errorf("%w: category=%d default selections=%d exceed selection_num=%d", errCurrentBoosterPVFInvalid, category, defaults, definition.SelectionRequired)
+			}
+		}
+	case currentBoosterRequestRandom:
+		if stackableType != "[booster]" && stackableType != "[cera booster]" && stackableType != "[booster random]" && !currentLotterySupportedType(stackableType) {
+			return currentBoosterDefinition{}, fmt.Errorf("%w: source item=%d type=%q is not random", errCurrentBoosterPVFInvalid, sourceItemID, stackableType)
+		}
+		if stackableType == "[upgradable legacy]" {
+			levels := document.Ints("minimum level")
+			if len(levels) > 1 || (len(levels) == 1 && (levels[0] < 0 || levels[0] > math.MaxUint8)) {
+				return currentBoosterDefinition{}, errCurrentBoosterPVFInvalid
+			}
+			if len(levels) == 1 {
+				definition.GoldMinimumLevel = levels[0]
+			}
+		}
+		definition.Random, err = resolveCurrentMagicBox(catalog, catalog.source, int64(sourceItemID))
+		if errors.Is(err, errMagicBoxBoosterInfoGated) && character != nil {
+			definition.Random, err = resolveCurrentMagicBoxForCharacter(catalog, catalog.source, int64(sourceItemID), character)
+			definition.RandomCharacter = &currentBoosterRewardCharacter{Job: character.Job, Level: character.Level}
+		}
+		if err != nil {
+			return currentBoosterDefinition{}, err
+		}
+		if definition.Random.Kind != "random" || len(definition.Random.Groups) == 0 {
+			return currentBoosterDefinition{}, fmt.Errorf("%w: source item=%d has no random reward groups", errCurrentBoosterPVFInvalid, sourceItemID)
+		}
+	default:
+		return currentBoosterDefinition{}, errCurrentBoosterRequestMalformed
+	}
+	if materialValues := document.Ints("need material"); len(materialValues) > 0 {
+		if len(materialValues) < 2 ||
+			materialValues[0] <= 0 ||
+			materialValues[1] <= 0 ||
+			materialValues[1] > currentBoosterMaxRewardUnits {
+			return currentBoosterDefinition{}, fmt.Errorf("%w: source item=%d need_material=%v", errCurrentBoosterPVFInvalid, sourceItemID, materialValues)
+		}
+		definition.MaterialItemID = materialValues[0]
+		definition.MaterialCount = materialValues[1]
+	}
+	return definition, nil
+}
+
+func parseCurrentBoosterSelectionCandidates(document *dnfpvf.Document) ([]currentBoosterSelectionCandidate, error) {
+	candidates, _, err := parseCurrentBoosterSelectionCatalog(document)
+	return candidates, err
+}
+
+func parseCurrentBoosterSelectionCatalog(
+	document *dnfpvf.Document,
+) ([]currentBoosterSelectionCandidate, map[uint16][]currentBoosterSelectionCandidate, error) {
+	if document == nil {
+		return nil, nil, errCurrentBoosterPVFInvalid
+	}
+	inCategory := false
+	// categoryReopened 只在"同一个 category id 的第二段块"内为真：真档里
+	// `[booster select category] 7 4` 会在同一份 .stk 里出现两次（第二次是
+	// `[stackable]` 空占位块），合并后块内出现与第一段完全相同的行时按重复
+	// 占位丢弃，而不是把整只礼盒判成非法 PVF（旧行为 ⇒ 客户端弹通用失败码 4）。
+	categoryReopened := false
+	var categoryID uint16
+	var equipmentUpgrade byte
+	var equipmentSeparate byte
+	var equipmentUpgradeTable currentBoosterUpgradeTable
+	result := make([]currentBoosterSelectionCandidate, 0, 8)
+	seen := make(map[uint32]currentBoosterSelectionCandidate)
+	categorySeen := make(map[uint16]map[uint32]struct{})
+	categories := make(map[uint16][]currentBoosterSelectionCandidate)
+	defaults := make(map[uint16]map[uint32]struct{})
+	selectionNum := document.Ints("booster selection num")
+	previousSection := ""
+	for _, section := range document.Sections {
+		name := normalizeMagicBoxSectionName(section.Name)
+		priorSection := previousSection
+		previousSection = name
+		switch name {
+		case "booster select category":
+			equipmentUpgrade = 0
+			equipmentSeparate = 0
+			equipmentUpgradeTable = currentBoosterUpgradeTable{}
+			if inCategory {
+				return nil, nil, fmt.Errorf("nested booster selection category")
+			}
+			header := magicBoxSectionInts(document, section)
+			if len(header) == 0 ||
+				header[0] < 0 ||
+				header[0] > math.MaxUint8 ||
+				(len(header) > 1 && (header[1] < 0 || header[1] > math.MaxUint8)) {
+				return nil, nil, fmt.Errorf("invalid booster selection category header=%v", header)
+			}
+			// Current NoPack writes the two category header bytes separately
+			// immediately after source_slot. Keep the same little-endian key
+			// instead of discarding the grow-type/subcategory byte.
+			categoryID = uint16(header[0])
+			if len(header) > 1 {
+				categoryID |= uint16(header[1]) << 8
+			}
+			categoryReopened = false
+			if _, duplicate := categories[categoryID]; duplicate {
+				// 真档证据（`runtime/data/dnf/Script.pvf` 的
+				// `stackable/cash/chn_490700910.stk`，道具 490700910 = 灿烂徽章礼盒）：
+				// 61 个 `[booster select category]` 块只有 60 个不同 id ——
+				// `7 4`（id 1031）出现两次，第二次是 `[stackable]` 空占位块。
+				// 线上同一时刻的拒绝理由逐字为
+				// `duplicate booster selection category=1031`，op160 失败体恒为
+				// `00 04`，客户端把 body[1]=4 渲染成「物品栏空间不足」
+				// （厂商 Network/Builders/CeraShop/CeraShopPurchaseAckBuilder.cs:8-13）。
+				// 空占位块不携带任何选项，因此合并（第二个块的行追加进同一 category）
+				// 才是不丢数据的读法；`DNFBRIDGE_BOOSTER_SELECT_CATEGORY_DUPLICATE=reject`
+				// 一键回到 2026-09-28 之前的"整档判非法"。
+				if !boosterDuplicateSelectionCategoryMergeEnabled() {
+					return nil, nil, fmt.Errorf("duplicate booster selection category=%d", categoryID)
+				}
+				categoryReopened = true
+				inCategory = true
+				continue
+			}
+			inCategory = true
+			categories[categoryID] = make([]currentBoosterSelectionCandidate, 0, 8)
+			categorySeen[categoryID] = make(map[uint32]struct{})
+			continue
+		case "/booster select category":
+			if !inCategory {
+				// A second adjacent terminator has no content and cannot change
+				// the completed category. Do not accept an initial/unrelated close.
+				if priorSection == "/booster select category" && section.Start == section.End && len(categories) > 0 {
+					continue
+				}
+				return nil, nil, fmt.Errorf("booster selection category close without open")
+			}
+			inCategory = false
+			continue
+		}
+		if !inCategory || strings.HasPrefix(name, "/") {
+			continue
+		}
+		if name == "default select" {
+			// Count + item IDs, not item/count reward pairs. The IDs reference
+			// ordinary rows in this category. Preserve their real quantities and
+			// include them in selection_num rather than granting them twice.
+			values := magicBoxSectionInts(document, section)
+			if len(values) == 0 || len(values) != section.End-section.Start ||
+				values[0] < 0 || values[0] > currentBoosterMaxRewardRows || values[0] != int64(len(values)-1) {
+				return nil, nil, fmt.Errorf("invalid default select header")
+			}
+			previous, duplicate := defaults[categoryID]
+			if duplicate && !categoryReopened {
+				return nil, nil, fmt.Errorf("duplicate default select category=%d", categoryID)
+			}
+			defaults[categoryID] = make(map[uint32]struct{})
+			for _, value := range values[1:] {
+				if value <= 0 || value > math.MaxUint32 {
+					return nil, nil, fmt.Errorf("invalid default select item=%d", value)
+				}
+				id := uint32(value)
+				if _, duplicate := defaults[categoryID][id]; duplicate {
+					return nil, nil, fmt.Errorf("duplicate default select item=%d", id)
+				}
+				defaults[categoryID][id] = struct{}{}
+			}
+			if duplicate {
+				if len(previous) != len(defaults[categoryID]) {
+					return nil, nil, fmt.Errorf("conflicting default select category=%d", categoryID)
+				}
+				for id := range previous {
+					if _, same := defaults[categoryID][id]; !same {
+						return nil, nil, fmt.Errorf("conflicting default select category=%d", categoryID)
+					}
+				}
+			}
+			continue
+		}
+		values := magicBoxSectionInts(document, section)
+		if name == "booster equipment upgrade" || name == "booster equipment grade" || name == "booster equipment separate" {
+			// An empty/string/float attribute is not an empty reward table.
+			// Check the raw token before the generic zero-integer fast path.
+			if section.End-section.Start != 1 || len(values) != 1 || document.Tokens[section.Start].Kind != dnfpvf.TokenInt {
+				return nil, nil, fmt.Errorf("invalid %s integer metadata", name)
+			}
+		}
+		if name == "random probability" {
+			if equipmentUpgrade != 255 || equipmentUpgradeTable != (currentBoosterUpgradeTable{}) {
+				return nil, nil, fmt.Errorf("random upgrade table without unique marker")
+			}
+			var err error
+			equipmentUpgradeTable, err = parseCurrentBoosterUpgradeTable(document, section)
+			if err != nil {
+				return nil, nil, err
+			}
+			continue
+		}
+		if len(values) == 0 {
+			if name == "booster equipment upgrade" {
+				return nil, nil, fmt.Errorf("invalid booster equipment upgrade")
+			}
+			continue
+		}
+		if name == "booster equipment upgrade" {
+			// Native 0x3b406ee reads the category's integer; 0x3b40b61
+			// copies it only into equipment rows. 255 selects a distinct random
+			// upgrade table and must not become a literal reinforcement value.
+			if len(values) != 1 || values[0] < 0 || (values[0] > 31 && values[0] != 255) || section.End-section.Start != 1 {
+				return nil, nil, fmt.Errorf("unsupported booster equipment upgrade")
+			}
+			equipmentUpgrade = byte(values[0])
+			equipmentUpgradeTable = currentBoosterUpgradeTable{}
+			continue
+		}
+		if name == "booster equipment separate" {
+			// The native equipment row's second attribute is forging. Keep
+			// the existing inventory owner's 0..8 range and byte 0x57 contract.
+			if values[0] < 0 || values[0] > 8 {
+				return nil, nil, fmt.Errorf("unsupported booster equipment separate")
+			}
+			equipmentSeparate = byte(values[0])
+			continue
+		}
+		stride := 0
+		switch name {
+		case "avatar", "special avatar":
+			// Avatar choices carry item/count plus the client attribute
+			// category and option written in the 10-byte op160 request.
+			stride = 4
+		case "stackable", "creature", "equipment", "etc", "cera":
+			// Ordinary items, pets and enchant orbs are simple item/count
+			// pairs. Treating two adjacent pairs as one avatar quad made the
+			// second item look like an option byte and rejected valid choices.
+			stride = 2
+		default:
+			return nil, nil, fmt.Errorf("selection section=%q with %d integer values has unsupported runtime-PVF shape", section.Name, len(values))
+		}
+		if len(values)%stride != 0 {
+			return nil, nil, fmt.Errorf("selection section=%q values=%d is not divisible by stride=%d", section.Name, len(values), stride)
+		}
+		for offset := 0; offset < len(values); offset += stride {
+			itemID, count := values[offset], values[offset+1]
+			categoryKind, option := int64(0), int64(0)
+			if stride == 4 {
+				categoryKind, option = values[offset+2], values[offset+3]
+			}
+			if itemID <= 0 || itemID > math.MaxUint32 || count <= 0 || count > currentBoosterMaxRewardUnits || option < 0 || option > math.MaxUint8 {
+				return nil, nil, fmt.Errorf("selection section=%q invalid row=%v", section.Name, values[offset:offset+stride])
+			}
+			candidate := currentBoosterSelectionCandidate{
+				ItemID:       uint32(itemID),
+				Count:        uint32(count),
+				CategoryKind: categoryKind,
+				Option:       byte(option),
+			}
+			if name == "equipment" {
+				candidate.EquipmentUpgrade = equipmentUpgrade
+				candidate.EquipmentSeparate = equipmentSeparate
+				if equipmentUpgrade == 255 {
+					if equipmentUpgradeTable == (currentBoosterUpgradeTable{}) || count != 1 {
+						return nil, nil, fmt.Errorf("random upgrade requires table and one equipment instance")
+					}
+					candidate.EquipmentUpgradeTable = equipmentUpgradeTable
+				}
+			}
+			if previous, duplicate := seen[candidate.ItemID]; duplicate {
+				if previous != candidate {
+					return nil, nil, fmt.Errorf("selection item=%d has conflicting rows", candidate.ItemID)
+				}
+			} else {
+				seen[candidate.ItemID] = candidate
+				result = append(result, candidate)
+			}
+			if _, duplicate := categorySeen[categoryID][candidate.ItemID]; duplicate {
+				if categoryReopened || (len(selectionNum) == 1 && selectionNum[0] > 0) {
+					// The native rows may repeat an identical item. Requests select
+					// IDs, not row indices; for a positive explicit selection count
+					// an identical row adds no distinct choice. Conflicting rows
+					// were rejected above. selection_num=0 retains strict rejection
+					// because its all-rows semantics could depend on multiplicity.
+					// 合并进来的第二段块重复了第一段已有的行：它是同一份数据的
+					// 重复占位，丢掉这一行即可（真档 490700910 的第二段是空块，
+					// 这条只是对"非空重复块"的保守兜底）。
+					continue
+				}
+				return nil, nil, fmt.Errorf("selection category=%d has duplicate item=%d", categoryID, candidate.ItemID)
+			}
+			categorySeen[categoryID][candidate.ItemID] = struct{}{}
+			categories[categoryID] = append(categories[categoryID], candidate)
+		}
+	}
+	if inCategory {
+		return nil, nil, fmt.Errorf("booster selection category is not closed")
+	}
+	for id, candidates := range categories {
+		// Native 0x3b40beb compares each actual reward ID to the default-ID
+		// vector and only sets the row's default flag on a match. Stale default
+		// IDs are inert UI metadata, not an additional reward definition.
+		for i := range candidates {
+			_, candidates[i].DefaultSelected = defaults[id][candidates[i].ItemID]
+		}
+		// Job/grow-type selection documents retain empty category placeholders
+		// for combinations the client does not offer (for example a job without
+		// a fifth advancement).  They do not invalidate populated categories.
+		// currentBoosterSelectedCandidates still rejects an empty category if a
+		// forged request explicitly selects one.
+		if len(candidates) > currentBoosterMaxRewardRows {
+			return nil, nil, fmt.Errorf("booster selection category=%d rows=%d", id, len(candidates))
+		}
+	}
+	return result, categories, nil
+}
+
+// The compact UI carries a complete five-piece armor choice. Its identity is
+// the runtime definition, not the item number of one historical event.
+func currentBoosterCompleteArmorCategory(catalog *pvfDungeonDropCatalog, rows []currentBoosterSelectionCandidate) bool {
+	if len(rows) != 5 {
+		return false
+	}
+	parts := map[string]bool{"[coat]": false, "[pants]": false, "[shoulder]": false, "[shoes]": false, "[waist]": false}
+	for _, row := range rows {
+		if row.Count != 1 || row.CategoryKind != 0 || row.Option != 0 {
+			return false
+		}
+		item, err := catalog.ResolveItem(row.ItemID)
+		if err != nil || item.Kind != dungeonDropItemEquipment {
+			return false
+		}
+		seen, valid := parts[item.EquipmentType]
+		if !valid || seen {
+			return false
+		}
+		parts[item.EquipmentType] = true
+	}
+	return true
+}
+
+func currentBoosterSelectedCandidates(
+	definition currentBoosterDefinition,
+	request currentBoosterOpenRequest,
+) ([]currentBoosterSelectionCandidate, error) {
+	if request.CompactArmorSet && (!definition.CompactArmorCategories[request.SelectionContext] || definition.SelectionRequired != 0 || len(request.Selections) != 5) {
+		return nil, errCurrentBoosterSelectionInvalid
+	}
+	if len(request.Selections) == 0 {
+		return nil, errCurrentBoosterSelectionInvalid
+	}
+	category, found := definition.SelectionCategory[request.SelectionContext]
+	if !found || len(category) == 0 {
+		return nil, fmt.Errorf("%w: category=%d is not in source PVF", errCurrentBoosterSelectionInvalid, request.SelectionContext)
+	}
+	required := definition.SelectionRequired
+	if required == 0 {
+		required = len(category)
+	}
+	if required <= 0 || len(request.Selections) != required {
+		return nil, fmt.Errorf(
+			"%w: category=%d selected=%d want=%d",
+			errCurrentBoosterSelectionInvalid,
+			request.SelectionContext,
+			len(request.Selections),
+			required,
+		)
+	}
+	byItem := make(map[uint32]currentBoosterSelectionCandidate, len(category))
+	for _, candidate := range category {
+		byItem[candidate.ItemID] = candidate
+	}
+	selected := make([]currentBoosterSelectionCandidate, 0, len(request.Selections))
+	seen := make(map[uint32]struct{}, len(request.Selections))
+	for _, choice := range request.Selections {
+		if choice.ItemID == 0 {
+			return nil, errCurrentBoosterSelectionInvalid
+		}
+		if _, duplicate := seen[choice.ItemID]; duplicate {
+			return nil, fmt.Errorf("%w: duplicate item=%d", errCurrentBoosterSelectionInvalid, choice.ItemID)
+		}
+		seen[choice.ItemID] = struct{}{}
+		candidate, found := byItem[choice.ItemID]
+		if !found {
+			return nil, fmt.Errorf(
+				"%w: item=%d is not in source PVF category=%d",
+				errCurrentBoosterSelectionInvalid,
+				choice.ItemID,
+				request.SelectionContext,
+			)
+		}
+		if candidate.CategoryKind != 0 {
+			// Avatar category rows carry the client-selected attribute byte.
+			// The fourth PVF integer is not that runtime choice: the live
+			// eight-piece writer sends different values for hat/hair/top/etc.
+			candidate.Option = choice.Option
+		} else if candidate.Option != choice.Option {
+			return nil, fmt.Errorf("%w: item=%d option=%d want=%d", errCurrentBoosterSelectionInvalid, choice.ItemID, choice.Option, candidate.Option)
+		}
+		selected = append(selected, candidate)
+	}
+	for _, candidate := range category {
+		if candidate.DefaultSelected {
+			if _, found := seen[candidate.ItemID]; !found {
+				return nil, fmt.Errorf("%w: category=%d missing default item=%d", errCurrentBoosterSelectionInvalid, request.SelectionContext, candidate.ItemID)
+			}
+		}
+	}
+	return selected, nil
+}
+
+func validateCurrentBoosterSourceExpiration(stack dnfrepo.ItemStack, definition dungeonDropItemDefinition, now time.Time) error {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	if expire := currentItemListStackExpire(stack); expire != 0 {
+		if uint64(expire) <= uint64(now.Unix()) {
+			return errCurrentBoosterExpired
+		}
+		return nil
+	}
+	if definition.UsablePeriodDays > 0 && currentItemListStackExpire(stack) == 0 {
+		return errCurrentBoosterExpired
+	}
+	if !definition.ExpirationDate.IsZero() && !now.Before(definition.ExpirationDate) {
+		return errCurrentBoosterExpired
+	}
+	return nil
+}
+func resolveCurrentBoosterRewardAmounts(
+	definition currentBoosterDefinition,
+	request currentBoosterOpenRequest,
+	roll func(int64) (int64, error),
+) (map[uint32]uint32, map[uint32]byte, error) {
+	amounts := make(map[uint32]uint32)
+	options := make(map[uint32]byte)
+	switch request.Kind {
+	case currentBoosterRequestSelection:
+		candidates, err := currentBoosterSelectedCandidates(definition, request)
+		if err != nil {
+			return nil, nil, err
+		}
+		for _, candidate := range candidates {
+			current := uint64(amounts[candidate.ItemID])
+			if current+uint64(candidate.Count) > currentBoosterMaxRewardUnits {
+				return nil, nil, errCurrentBoosterPVFInvalid
+			}
+			amounts[candidate.ItemID] = uint32(current + uint64(candidate.Count))
+			options[candidate.ItemID] = candidate.Option
+		}
+	case currentBoosterRequestRandom:
+		if roll == nil {
+			return nil, nil, errCurrentBoosterPVFInvalid
+		}
+		for _, group := range definition.Random.Groups {
+			totalWeight := int64(0)
+			for _, entry := range group.Entries {
+				if entry.ItemID < 0 || (entry.ItemID == 0 && definition.StackableType != "[upgradable legacy]") || entry.ItemID > math.MaxUint32 || entry.Weight < 0 || entry.Count <= 0 || uint64(entry.Count) > currentBoosterRewardUnitLimit(uint32(entry.ItemID)) {
+					return nil, nil, errCurrentBoosterPVFInvalid
+				}
+				if entry.Weight > math.MaxInt64-totalWeight {
+					return nil, nil, errCurrentBoosterPVFInvalid
+				}
+				totalWeight += entry.Weight
+			}
+			if totalWeight <= 0 {
+				return nil, nil, errCurrentBoosterPVFInvalid
+			}
+			drawCount := group.DrawCount
+			if drawCount < 1 {
+				drawCount = 1
+			}
+			if drawCount > currentBoosterMaxRewardRows {
+				return nil, nil, errCurrentBoosterPVFInvalid
+			}
+			for draw := int64(0); draw < drawCount; draw++ {
+				value, err := roll(totalWeight)
+				if err != nil || value < 0 || value >= totalWeight {
+					return nil, nil, fmt.Errorf("%w: random roll: %v", errCurrentBoosterPVFInvalid, err)
+				}
+				cumulative := int64(0)
+				for _, entry := range group.Entries {
+					cumulative += entry.Weight
+					if value >= cumulative {
+						continue
+					}
+					current := uint64(amounts[uint32(entry.ItemID)])
+					if current+uint64(entry.Count) > currentBoosterRewardUnitLimit(uint32(entry.ItemID)) {
+						return nil, nil, errCurrentBoosterPVFInvalid
+					}
+					amounts[uint32(entry.ItemID)] = uint32(current + uint64(entry.Count))
+					break
+				}
+			}
+		}
+	default:
+		return nil, nil, errCurrentBoosterRequestMalformed
+	}
+	if len(amounts) == 0 || len(amounts) > currentBoosterMaxRewardRows {
+		return nil, nil, errCurrentBoosterPVFInvalid
+	}
+	return amounts, options, nil
+}
+
+func secureCurrentBoosterRoll(limit int64) (int64, error) {
+	if limit <= 0 {
+		return 0, errCurrentBoosterPVFInvalid
+	}
+	value, err := cryptorand.Int(cryptorand.Reader, big.NewInt(limit))
+	if err != nil {
+		return 0, err
+	}
+	return value.Int64(), nil
+}
+
+func resolveCurrentBoosterRewards(
+	catalog *pvfDungeonDropCatalog,
+	amounts map[uint32]uint32,
+	options map[uint32]byte,
+	sourceStack dnfrepo.ItemStack,
+	now time.Time,
+) ([]currentBoosterReward, error) {
+	itemIDs := make([]uint32, 0, len(amounts))
+	for itemID := range amounts {
+		itemIDs = append(itemIDs, itemID)
+	}
+	sort.Slice(itemIDs, func(i, j int) bool { return itemIDs[i] < itemIDs[j] })
+	rewards := make([]currentBoosterReward, 0, len(itemIDs))
+	for _, itemID := range itemIDs {
+		count := amounts[itemID]
+		definition, err := catalog.ResolveItem(itemID)
+		if err != nil {
+			return nil, fmt.Errorf("%w: resolve reward item=%d: %v", errCurrentBoosterPVFInvalid, itemID, err)
+		}
+		definition, err = currentPVFItemDefinitionForNestedRewardGrantAt(definition, sourceStack, now)
+		if err != nil {
+			return nil, fmt.Errorf("%w: reward item=%d expiration: %v", errCurrentBoosterPVFInvalid, itemID, err)
+		}
+		document, err := parseDungeonCardPVFDocument(catalog.source, definition.PVFPath)
+		if err != nil {
+			return nil, fmt.Errorf("%w: reward item=%d: %v", errCurrentBoosterPVFInvalid, itemID, err)
+		}
+		attachType := normalizeMagicBoxPVFType(magicBoxDocumentText(document, "attach type"))
+		placement, err := currentBoosterPlacement(definition)
+		if err != nil {
+			return nil, err
+		}
+		rewards = append(rewards, currentBoosterReward{
+			Definition: definition,
+			Count:      count,
+			Option:     options[itemID],
+			Seal:       attachType == "sealing" || currentNewPVFEquipmentSealFlag(definition) != 0,
+			Placement:  placement,
+		})
+	}
+	return rewards, nil
+}
+
+// currentBoosterPlacement 决定礼盒奖励落到哪个容器。判定本体是
+// currentPVFItemTargetContainer（唯一真源）：宠物消耗品家族 = `[feed]` + `[creature]`
+// （更名卡 25 属于后者，旧代码只认 `[feed]`，于是礼盒开出的更名卡落在主背包消耗品页）。
+func currentBoosterPlacement(definition dungeonDropItemDefinition) (currentBoosterRewardPlacement, error) {
+	container := currentPVFItemTargetContainer(definition)
+	switch definition.Kind {
+	case dungeonDropItemStackable:
+		if container.PetConsumable {
+			return currentBoosterRewardPetConsumable, nil
+		}
+		if container.GuardianGem {
+			// 公会守护珠（[stackable type] `[flag gem]`）属于 wire list 38 的
+			// 守护珠页 49..97，不是主背包消耗品页。
+			return currentBoosterRewardGuildMedal, nil
+		}
+		return currentBoosterRewardMain, nil
+	case dungeonDropItemEquipment:
+		switch {
+		case container.PetBody:
+			return currentBoosterRewardPetBody, nil
+		case container.Avatar:
+			return currentBoosterRewardAvatar, nil
+		case container.PetArtifact:
+			return currentBoosterRewardPetArtifact, nil
+		case container.GuildMedal:
+			// 公会勋章（[equipment type] `[flag]`）属于 wire list 38 的勋章页 0..48。
+			return currentBoosterRewardGuildMedal, nil
+		}
+		return currentBoosterRewardMain, nil
+	default:
+		return currentBoosterRewardMain, errCurrentBoosterPVFInvalid
+	}
+}
+
+func currentBoosterRewardUnitLimit(itemID uint32) uint64 {
+	if itemID == 0 {
+		return math.MaxInt32
+	}
+	return currentBoosterMaxRewardUnits
+}

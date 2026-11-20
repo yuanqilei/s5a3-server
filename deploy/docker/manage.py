@@ -1,0 +1,616 @@
+"""Reproducible, private-interface Docker profile. Requires Python 3.10+ and Docker."""
+import argparse
+import hashlib
+import ipaddress
+import json
+import os
+from pathlib import Path
+import re
+import secrets
+import shutil
+import socket
+import subprocess
+import sys
+
+ROOT = Path(__file__).resolve().parents[2]
+RUNTIME = ROOT / "runtime" / "docker"
+IMAGE = "servers5a3-local:dev"
+PROJECT = "servers5a3-local"
+CHANNEL_TABLE = ROOT / "go-server/internal/services/dnfbridge/testdata/channel_info.etc"
+CHANNEL_TABLE_SHA256 = "5630b099ef98e322806c35cec25be7c7aae699ebfbc8f16e60f1a70d12bfe7d7"
+
+
+def selected_channel_table(config, explicit_source, existing):
+    """Select the common public/private baseline before preparing any files."""
+    if digest(CHANNEL_TABLE) != CHANNEL_TABLE_SHA256:
+        raise ValueError("Bundled channel table differs from the common 120-channel baseline")
+    source = Path(explicit_source).resolve(strict=True) if explicit_source else CHANNEL_TABLE
+    if digest(source) != CHANNEL_TABLE_SHA256:
+        raise ValueError("External channel table must match the common 120-channel baseline; see Docs/CHANNEL_TABLE_DEPLOYMENT.md")
+    current = config.get("channel_file", "channel_info.etc")
+    if current not in ("channel_info.etc", "channel.override.etc"):
+        raise ValueError("Unrecognized channel_file in instance.json")
+    assets = RUNTIME / "data"
+    active = assets / current
+    if existing and not explicit_source and (not active.is_file() or digest(active) != CHANNEL_TABLE_SHA256):
+        raise ValueError("Existing runtime channel table differs or is missing; back it up and explicitly select --channel-info after reviewing Docs/CHANNEL_TABLE_DEPLOYMENT.md")
+    override = assets / "channel.override.etc"
+    if override.exists() and digest(override) != CHANNEL_TABLE_SHA256:
+        raise ValueError("Existing external channel table differs; preserve it before replacing")
+    return source
+
+
+def checked_channel_catalog(catalog, channel_path):
+    """Reject an old extractor ignoring -channel or reporting other ports."""
+    raw = channel_path.read_bytes()
+    ports = [10000 + int(value) for value in re.findall(rb"(?m)^[ \t]*(\d+)[ \t]+`<chn_channel_info_[^`]+>`", raw)]
+    actual = catalog.get("ports")
+    if (hashlib.sha256(raw).hexdigest() != CHANNEL_TABLE_SHA256 or
+            catalog.get("sha256") != CHANNEL_TABLE_SHA256 or
+            catalog.get("source") != "external:channel.override.etc" or
+            type(catalog.get("channels")) is not int or catalog["channels"] != 120 or
+            not isinstance(actual, list) or any(type(p) is not int for p in actual) or
+            len(actual) != 120 or len(set(actual)) != 120 or sorted(actual) != sorted(ports)):
+        raise ValueError("Prepared channel catalog differs from the common 120-channel baseline")
+    return catalog
+
+BUFF_GROUP_SYNC_KEY = "DNFBRIDGE_BUFF_GROUP_SYNC"
+TAG_BUFF_CLIENTS = frozenset((
+    "40657c19955dc2f594fc2221ef91044170d86406ba6fd193cdb1839877f28cb0",
+    "58e51fba3258a9499e77caedaea16a6d9f38904054e10edd91564e24894547c4",
+    "a853463e2e6b05b6a0f779a8fa27c0787432331b29c517d331574820d3cf43cf",
+))
+WEDDING_FEMALE_CLIENTS = frozenset((
+    "f16d3bf48b6b802378fb066eaab96add8132c6406d7941a6d8d60328e47f6d8b",
+    "58e51fba3258a9499e77caedaea16a6d9f38904054e10edd91564e24894547c4",
+    "a853463e2e6b05b6a0f779a8fa27c0787432331b29c517d331574820d3cf43cf",
+))
+BUFF_GROUP_CLIENTS = {
+    "69ea3a8b38d70af340baed28ec03e88162e7d3e434f5f99c9d5b71dafc12f544": "on",  # V212
+    "a28601e349a65a1ec0356995b693a326620d81887031c17b76b5b73daaeb5216": "on",  # V213
+    "6402835223a23f9e4300c57c175d1b990b78ab0eecc46bd03fd373d0893e73f4": "on",  # V214
+    "28e04d1d1c148c841318d533ed8ccb3e426ba5a5f24328b3c913b81303b12a84": "on",  # V215
+    **{identity: "on" for identity in TAG_BUFF_CLIENTS | WEDDING_FEMALE_CLIENTS},
+    "bc613e368e8fd49c50c35163f2ed8a28564fc23342701a5a6c22b839f3bf6b7a": "off",  # legacy v56
+}
+
+RUNTIME_COMPATIBILITY_VALUES = {
+    "DNFBRIDGE_BUFF_GROUP_SYNC": ("off", "on"),
+    "DNFBRIDGE_EXPERIMENTAL_PEAK": ("off", "on"),
+    "DNFBRIDGE_MYSQL_INSERT_BATCH": None,
+    "DNFBRIDGE_INVENTORY_SAVE_SCOPE": ("collection", "slot"),
+    "DNFBRIDGE_EQUIPMENT_SAVE_SCOPE": ("collection", "entry"),
+    "DNFBRIDGE_OWNER_CONTEXT_USE_CLIENT_CHANNEL": ("on",),
+    "DNFBRIDGE_PARTY_SELECTOR_MEMBER_SELF_PREPARE": ("on",),
+    "DNFBRIDGE_PARTY_DUNGEON_ALL_MEMBER_USER_STATE": ("all",),
+    "DNFBRIDGE_DUNGEON_DEATH_ROOM_PROOF": ("room_proven",),
+    "DNFBRIDGE_HELL_BLOCKED_SLOTS": ("on",),
+    "DNFBRIDGE_DUNGEON_ENTRY_SELECTION_MODE": ("allow",),
+    "DNFBRIDGE_PEER_USERINFO_IDENTITY_CARRIER_MODE0_GUARD": ("on",),
+    "DNFBRIDGE_TOWN_NPC_EVENT_CATALOG": ("on",),
+    "DNFBRIDGE_PARTY_FORMATION_ORDER": ("vendor_wire",),
+    "DNFBRIDGE_PARTY_PEER_ENDPOINTS_AFTER_ROSTER": ("repeat",),
+    "DNFBRIDGE_PARTY_PEER_ENDPOINT_REBROADCAST": ("on",),
+    "DNFBRIDGE_LOGIN_AREA_GATES": ("strict",),
+    "DNFBRIDGE_HOTKEY_SEEDED_LAYOUT": ("off",),
+    "DNFBRIDGE_SKILL_SWITCH_CANDIDATE_PAIRS": ("off",),
+    "DNFBRIDGE_LOGIN_SKILL_SWITCH_LOADOUT_AFTER_COMMIT": ("before_transition_only",),
+    "DNFBRIDGE_PEER_SKILL_PAGE_TOWN": ("off",),
+    "DNFBRIDGE_SKILL_SWITCH_DOWNLINK_SHAPE": ("off",),
+    "DNFBRIDGE_SKILL_SWITCH_ANSWER_AT_SCENE_READY": ("off",),
+}
+
+
+def party_udp_relay_port_count(config):
+    value = config.get("party_udp_relay_port_count", 64)
+    if type(value) is not int or not 64 <= value <= 1024:
+        raise ValueError("party_udp_relay_port_count must be an integer from 64 to 1024")
+    return value
+
+
+def reviewed_client_sha256(config):
+    directory = config.get("client_dir")
+    executable = Path(directory) / "DNF.exe" if isinstance(directory, str) else None
+    if executable is None or not executable.is_file():
+        raise ValueError("paired client option requires DNF.exe in client_dir")
+    with executable.open("rb") as handle:
+        digest = hashlib.sha256()
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+        return digest.hexdigest()
+
+
+def selected_client_protocol_env(config, buff_group_sync):
+    mode = config.get("tag_buff_group_sync", "off")
+    if type(mode) is not str or mode not in ("off", "auto", "on"):
+        raise ValueError("tag_buff_group_sync must be off, auto or on")
+    policy = config.get("wedding_gender_policy", "opposite_only")
+    if type(policy) is not str or policy not in ("opposite_only", "deny_male_male"):
+        raise ValueError("wedding_gender_policy must be opposite_only or deny_male_male")
+    env = {"DNFBRIDGE_TAG_BUFF_GROUP_SYNC": "off",
+           "DNFBRIDGE_WEDDING_GENDER_POLICY": policy}
+    if mode != "off" or policy == "deny_male_male":
+        if config.get("client_version", "official-24.9") != "official-24.9":
+            raise ValueError("selected client options require official-24.9")
+        identity = reviewed_client_sha256(config)
+        if mode == "on" and identity not in TAG_BUFF_CLIENTS:
+            raise ValueError("tag Buff groups require the exact paired receiver")
+        if mode != "off" and identity in TAG_BUFF_CLIENTS:
+            if buff_group_sync != "on":
+                raise ValueError("tag Buff groups require buff_group_sync on")
+            env["DNFBRIDGE_TAG_BUFF_GROUP_SYNC"] = "on"
+        if policy == "deny_male_male" and identity not in WEDDING_FEMALE_CLIENTS:
+            raise ValueError("wedding gender policy requires the exact paired client")
+    return env
+
+
+def runtime_compatibility_env(config):
+    compatibility = config.get("runtime_compatibility", {})
+    if compatibility == {}:
+        return {}
+    if not isinstance(compatibility, dict):
+        raise ValueError("runtime_compatibility must be an object")
+    validated = {}
+    for key, value in compatibility.items():
+        if key not in RUNTIME_COMPATIBILITY_VALUES:
+            raise ValueError(f"runtime_compatibility contains unsupported key: {key}")
+        if not isinstance(value, str):
+            raise ValueError(f"runtime_compatibility value must be a string: {key}")
+        allowed = RUNTIME_COMPATIBILITY_VALUES[key]
+        if allowed is None:
+            if not re.fullmatch(r"[0-9]+", value) or not 1 <= int(value) <= 1000:
+                raise ValueError("DNFBRIDGE_MYSQL_INSERT_BATCH must be an integer from 1 to 1000")
+        elif value not in allowed:
+            raise ValueError(f"runtime_compatibility value is not allowed: {key}={value}")
+        validated[key] = value
+    return validated
+
+
+def buff_group_sync_env(config, compatibility):
+    mode = config.get("buff_group_sync")
+    if "buff_group_sync" in config and mode not in ("auto", "on", "off"):
+        raise ValueError("buff_group_sync must be auto, on or off")
+    explicit = compatibility.get(BUFF_GROUP_SYNC_KEY)
+    if (mode == "on" or explicit == "on") and config.get("client_version", "official-24.9") != "official-24.9":
+        raise ValueError("buff_group_sync on requires client_version official-24.9")
+    if explicit is not None:
+        if mode in ("on", "off") and mode != explicit:
+            raise ValueError("buff_group_sync conflicts with runtime_compatibility")
+        return explicit
+    if mode != "auto":
+        return mode  # Old instance files retain their unconfigured behavior.
+    if config.get("client_version", "official-24.9") != "official-24.9":
+        return "off"
+    client_dir = config.get("client_dir")
+    if not client_dir:
+        return "on"  # A fresh server-only installation targets the current public client.
+    executable = Path(client_dir) / "DNF.exe"
+    if not executable.is_file():
+        raise ValueError("buff_group_sync auto requires DNF.exe in client_dir; select on for V212+ or off for a legacy client")
+    mode = BUFF_GROUP_CLIENTS.get(digest(executable))
+    if mode is None:
+        raise ValueError("buff_group_sync auto does not recognize DNF.exe; select the verified on/off client protocol explicitly")
+    return mode
+
+
+def run(*args, capture=False):
+    return subprocess.run(list(map(str, args)), check=True, text=True,
+                          stdout=subprocess.PIPE if capture else None).stdout
+
+
+def write(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(value, encoding="utf-8", newline="\n")
+    path.chmod(0o600)
+
+
+def digest(path):
+    sha = hashlib.sha256()
+    with path.open("rb") as stream:
+        for data in iter(lambda: stream.read(1024 * 1024), b""):
+            sha.update(data)
+    return sha.hexdigest()
+
+
+def private_ipv4(value):
+    address = ipaddress.IPv4Address(value)
+    if not any(address in ipaddress.ip_network(n) for n in
+               ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")):
+        raise ValueError("Use an RFC1918 private LAN IPv4 for this local profile")
+    return str(address)
+
+
+def detect_ip():
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as connection:
+        connection.connect(("192.0.2.1", 9))  # Routing lookup; sends no packet.
+        return private_ipv4(connection.getsockname()[0])
+
+
+def build():
+    run("docker", "build", "-t", IMAGE, "-f", ROOT / "deploy/docker/Dockerfile", ROOT)
+
+
+def compose(*args):
+    run("docker", "compose", "-p", PROJECT, "-f", RUNTIME / "compose.json", *args)
+
+
+def management_token(c):
+    # Validate before preparation touches assets, instance.json or Compose.
+    if c.get("gm_enabled", False) is not False:
+        raise ValueError("GM moved to https://github.com/Cec1c/DNF90GM; migrate it separately before regenerating this profile")
+    token = c.get("player_admin_secret", "")
+    if not isinstance(token, str) or (token and not re.fullmatch(r"[0-9a-f]{32,128}", token)):
+        raise ValueError("player_admin_secret must be a generated hex secret of at least 32 characters")
+    return token
+
+
+def check_network(config):
+    subnet = ipaddress.ip_network(config["subnet"])
+    private_ipv4(str(subnet.network_address))
+    for key in ("server_ip", "database_ip"):
+        ip = ipaddress.ip_address(config[key])
+        if ip not in subnet or ip in (subnet.network_address, subnet.broadcast_address):
+            raise ValueError(f"{key} is not a usable address in subnet")
+    if config["server_ip"] == config["database_ip"]:
+        raise ValueError("Server and database require distinct addresses")
+    ids = run("docker", "network", "ls", "-q", capture=True).split()
+    if ids:
+        for network in json.loads(run("docker", "network", "inspect", *ids, capture=True)):
+            if network["Name"] == PROJECT + "_private":
+                continue
+            for item in network["IPAM"].get("Config") or []:
+                other = ipaddress.ip_network(item["Subnet"])
+                if other.version == 4 and subnet.overlaps(other):
+                    raise ValueError(f"Docker subnet overlaps {network['Name']}; edit instance.json")
+
+
+def prepare(args):
+    instance = RUNTIME / "instance.json"
+    existing = instance.exists()
+    if existing:
+        config = json.loads(instance.read_text(encoding="utf-8"))
+        if args.host_ip:
+            config["host_ip"] = private_ipv4(args.host_ip)
+        if args.client_dir:
+            config["client_dir"] = str(Path(args.client_dir).resolve())
+    else:
+        config = {
+            "profile": "docker-local-token-v1",
+            "host_ip": private_ipv4(args.host_ip) if args.host_ip else detect_ip(),
+            "subnet": "10.253.90.0/24", "server_ip": "10.253.90.2", "database_ip": "10.253.90.3",
+            "database_password": secrets.token_hex(24), "root_password": secrets.token_hex(24),
+            "admin_token": secrets.token_hex(32), "joust_event_enabled": True,
+            "client_dir": str(Path(args.client_dir).resolve()) if args.client_dir else "",
+            "body_codec": "plaintext", "client_body_codec": "plaintext",
+            "default_group_login_only": True,
+            "client_version": "official-24.9",
+            "buff_group_sync": "auto",
+        }
+    if getattr(args, "buff_group_sync", None) is not None:
+        config["buff_group_sync"] = args.buff_group_sync
+    compatibility = runtime_compatibility_env(config)
+    buff_group_sync = buff_group_sync_env(config, compatibility)
+    if not existing and config["buff_group_sync"] == "auto":
+        config["buff_group_sync"] = buff_group_sync
+    management_token(config)
+    channel_source = selected_channel_table(config, getattr(args, "channel_info", None), existing)
+    private_ipv4(config["host_ip"])
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind((config["host_ip"], 0))
+    for key in ("database_password", "root_password", "admin_token"):
+        if not config.get(key) or any(ch not in "0123456789abcdef" for ch in config[key]):
+            raise ValueError(f"{key} must remain a non-empty generated hex value")
+    check_network(config)
+    assets = RUNTIME / "data"
+    assets.mkdir(parents=True, exist_ok=True)
+    target = assets / "Script.pvf"
+    if args.pvf:
+        source = Path(args.pvf).resolve(strict=True)
+        if target.exists() and digest(source) != digest(target):
+            raise ValueError("Existing PVF differs; back it up and explicitly remove the old copy first")
+        if not target.exists():
+            shutil.copyfile(source, target)
+    if not target.is_file():
+        raise ValueError("Run prepare --pvf <client/Script.pvf> first")
+    target.chmod(0o644)
+    override = assets / "channel.override.etc"
+    if not override.exists():
+        shutil.copyfile(channel_source, override)
+    override.chmod(0o644)
+    if args.channel_info or config.get("channel_file") != override.name or not config.get("channel_source"):
+        config["channel_source"] = str(channel_source)
+    config["channel_file"] = override.name
+    # Always pass the shared external table, independent of the PVF's directory.
+    user = f"{os.getuid()}:{os.getgid()}" if os.name != "nt" else "0:0"
+    channel_file = override.name
+    channel_args = ["-channel", "/data/" + channel_file]
+    report = run("docker", "run", "--rm", "--network", "none", "--user", user,
+                 "--mount", f"type=bind,source={assets},target=/data", "--entrypoint", "DNF90Assets",
+                 config.get("server_image", IMAGE), "-pvf", "/data/Script.pvf", "-output", "/data/" + channel_file, *channel_args, capture=True)
+    catalog = checked_channel_catalog(json.loads(report), override)
+    (assets / channel_file).chmod(0o644)
+    catalog["pvf_sha256"] = digest(target)
+    write(assets / "manifest.json", json.dumps(catalog, indent=2) + "\n")
+    write(instance, json.dumps(config, indent=2) + "\n")
+    generate(config, catalog)
+    print(f"Prepared {catalog['channels']} real channels; configuration: {instance}")
+
+
+def performance_resource_config(config):
+    """Explicit host budget; ordinary small deployments retain their defaults."""
+    c = dict(config)
+    profile = c.get("performance_profile")
+    if profile not in (None, "shared-4c-16g"):
+        raise ValueError("unsupported performance_profile")
+    if profile == "shared-4c-16g":
+        for key, value in {"server_memory_limit": "10g", "go_memory_limit": "8GiB",
+                           "database_memory_limit": "3g", "database_buffer_pool_size": "1g"}.items():
+            c.setdefault(key, value)
+    pool = c.get("database_buffer_pool_size")
+    if pool is not None:
+        def size(value):
+            match = re.fullmatch(r"([1-9][0-9]*)([kmgt]?)(?:i?b)?", str(value).lower())
+            if not match:
+                raise ValueError("invalid database memory size")
+            return int(match[1]) * 1024 ** ("kmgt".find(match[2]) + 1 if match[2] else 0)
+        limit = c.get("database_memory_limit")
+        if limit is None or size(pool) > min(size(limit) * 3 // 5, size(limit) - 256 * 1024**2):
+            raise ValueError("database_buffer_pool_size needs database_memory_limit with working headroom")
+    return c
+
+
+def generate(c, catalog):
+    c = performance_resource_config(c)
+    owner_range = c.get("channel_directory_owner_range")
+    if "channel_directory_owner_range" in c and owner_range not in ("off", "u8"):
+        raise ValueError("channel_directory_owner_range must be off or u8")
+    percent = c.get("main_quest_exp_percent")
+    if "main_quest_exp_percent" in c and (type(percent) is not int or not 0 <= percent <= 100):
+        raise ValueError("main_quest_exp_percent must be an integer from 0 to 100")
+    multiplier = c.get("main_quest_exp_multiplier")
+    if "main_quest_exp_multiplier" in c and (type(multiplier) is not int or not 1 <= multiplier <= 100):
+        raise ValueError("main_quest_exp_multiplier must be an integer from 1 to 100")
+    encoding = c.get("channel_script_encoding")
+    if "channel_script_encoding" in c and (type(encoding) is not str or encoding not in ("utf8", "gbk")):
+        raise ValueError("channel_script_encoding must be utf8 or gbk")
+    tournament = c.get("dungeon_tournament")
+    if "dungeon_tournament" in c and tournament not in ("off", "vendor"):
+        raise ValueError("dungeon_tournament must be off or vendor")
+    solo_create = c.get("guild_solo_create", False)
+    if type(solo_create) is not bool:
+        raise ValueError("guild_solo_create must be a boolean")
+    guild_ranking = c.get("guild_ranking_enabled", False)
+    if type(guild_ranking) is not bool:
+        raise ValueError("guild_ranking_enabled must be a boolean")
+    guild_essence = c.get("guild_essence_enabled", False)
+    if type(guild_essence) is not bool:
+        raise ValueError("guild_essence_enabled must be a boolean")
+    guardian_policy = c.get("guild_guardian_policy")
+    guild_hongbao = c.get("guild_hongbao_enabled", False)
+    if type(guild_hongbao) is not bool:
+        raise ValueError("guild_hongbao_enabled must be a boolean")
+    contribution_policy = c.get("guild_contribution_policy", "")
+    if type(contribution_policy) is not str or contribution_policy not in ("", "daily-v1"):
+        raise ValueError("guild_contribution_policy must be empty or daily-v1")
+    if "guild_guardian_policy" in c:
+        fields = {"first_purchase", "initial_level", "initial_skills", "first_select"}
+        if type(guardian_policy) is not dict or set(guardian_policy) != fields:
+            raise ValueError("guild_guardian_policy requires all four policy fields")
+        skills = guardian_policy["initial_skills"]
+        if (guardian_policy["first_purchase"] not in ("free_once", "paid")
+                or type(guardian_policy["initial_level"]) is not int
+                or not 1 <= guardian_policy["initial_level"] <= 50
+                or type(skills) is not list or len(skills) != 5
+                or any(type(v) is not int or not 0 <= v <= 5 for v in skills)
+                or type(guardian_policy["first_select"]) is not bool):
+            raise ValueError("guild_guardian_policy contains invalid policy values")
+    buff_swap_reapply = c.get("buff_swap_reapply")
+    if buff_swap_reapply is not None and buff_swap_reapply not in ("on", "off"):
+        raise ValueError("buff_swap_reapply must be 'on' or 'off' when configured")
+    compatibility_env = runtime_compatibility_env(c)
+    buff_group_sync = buff_group_sync_env(c, compatibility_env)
+    selected_protocol_env = selected_client_protocol_env(c, buff_group_sync)
+    relay_count = party_udp_relay_port_count(c)
+    advertised_server = c.get("channel_advertise_server", 0)
+    if type(advertised_server) is not int or not 0 <= advertised_server < 250:
+        raise ValueError("channel_advertise_server must be an integer from 0 to 249")
+    multiplier = c.get("main_quest_exp_multiplier")
+    if "main_quest_exp_multiplier" in c and (type(multiplier) is not int or not 1 <= multiplier <= 100):
+        raise ValueError("main_quest_exp_multiplier must be an integer from 1 to 100")
+    percent = c.get("main_quest_exp_percent")
+    if "main_quest_exp_percent" in c and (type(percent) is not int or not 0 <= percent <= 100):
+        raise ValueError("main_quest_exp_percent must be an integer from 0 to 100")
+    gold_diagnostic_character = c.get("gold_diagnostic_character")
+    if "gold_diagnostic_character" in c and (
+            type(gold_diagnostic_character) is not int
+            or not 0 <= gold_diagnostic_character <= 2147483647):
+        raise ValueError("gold_diagnostic_character must be an integer from 0 to 2147483647")
+    disjoint_epic_display = c.get("disjoint_epic_display")
+    if "disjoint_epic_display" in c and (
+            type(disjoint_epic_display) is not str
+            or disjoint_epic_display not in ("off", "paired-v1")):
+        raise ValueError("disjoint_epic_display must be off or paired-v1")
+    town_display_only = c.get("town_display_only")
+    if "town_display_only" in c and (type(town_display_only) is not str or town_display_only not in ("off", "on")):
+        raise ValueError("town_display_only must be off or on")
+    game_token = management_token(c)
+    server = RUNTIME / "server"
+    for directory in (server / "logs", server / "configs/dnf", server / "configs/servergroup"):
+        directory.mkdir(parents=True, exist_ok=True)
+    dsn = f"dnf:{c['database_password']}@tcp({c['database_ip']}:3306)/dnf_local?parseTime=true&charset=utf8mb4,utf8&interpolateParams=true"
+    q = json.dumps
+    config = f'''[service]
+name = "dnfbridge"
+node_id = "dnfbridge-docker-1"
+environment = "local"
+public_addr = "{c['host_ip']}:7001"
+private_addr = "{c['server_ip']}:18111"
+[cluster]
+id = "local"
+gid = 2
+virtual_gid = 2
+shard_id = 9999
+zone = "local"
+version = "local"
+data_version = "local"
+[admin]
+listen = "{c['server_ip']}:18111"
+token = {q(c['admin_token'])}
+[pvf]
+enabled = true
+path = "data/dnf/Script.pvf"
+max_bytes = 536870912
+preload_chunks = false
+[server_group]
+enabled = true
+store_kind = "file"
+plan_file = "configs/servergroup/plan.json"
+[topology]
+enabled = false
+[worker]
+size = 8
+queue = 256
+[profile_store]
+store_kind = "memory"
+'''
+    for section in ("idempotency", "registry", "bus", "cache", "lock", "presence"):
+        config += f'[{section}]\nkind = "memory"\n'
+    write(server / "configs/dnfbridge.toml", config)
+    write(server / "configs/dnf/logic.toml", f'''[repository]
+enabled = true
+mysql_dsn = {q(dsn)}
+mysql_max_open_conns = 32
+mysql_max_idle_conns = 32
+mysql_conn_max_lifetime_seconds = 300
+shard_id = "9999"
+table_prefix = "dnf"
+server_group_plan_file = "configs/servergroup/plan.json"
+auto_create_schema = true
+csharp_legacy_schema = true
+create_databases = false
+''')
+    plan = {"version": "dnf90-docker-v1",
+            "shards": [{"id": "9999", "group_id": "logic-local-1", "state": "open",
+                        "open_at": "2026-01-01T00:00:00Z", "public_open_at": "2026-01-01T00:00:00Z"}],
+            "groups": [{"id": "logic-local-1", "service": "logic", "member_id": "logic-local-1", "state": "open"}],
+            "routes": [{"feature": "dnf_repository", "shard_id": "9999", "group_id": "logic-local-1",
+                        "state": "open", "meta": {"dnf.repository.write_database": "dnf_local",
+                                                   "dnf.repository.read_database": "dnf_local"}}]}
+    write(server / "configs/servergroup/plan.json", json.dumps(plan, indent=2))
+    env = {
+        **selected_protocol_env,
+        "DNFBRIDGE_GUILD_SOLO_CREATE": str(solo_create).lower(),
+        "DNFBRIDGE_GUILD_RANKING_ENABLED": str(guild_ranking).lower(),
+        "DNFBRIDGE_GUILD_ESSENCE_ENABLED": str(guild_essence).lower(),
+        "DNFBRIDGE_GUILD_GUARDIAN_POLICY": json.dumps(guardian_policy, separators=(",", ":")) if guardian_policy is not None else "",
+        "DNFBRIDGE_GUILD_CONTRIBUTION_POLICY": contribution_policy,
+        "DNFBRIDGE_GUILD_HONGBAO_ENABLED": str(guild_hongbao).lower(),
+        "DNFBRIDGE_CHANNEL_LISTEN": c["server_ip"] + ":7001",
+        "DNFBRIDGE_GAME_LISTEN_HOST": c["server_ip"], "DNFBRIDGE_SERVER_IP": c["host_ip"],
+        "DNFBRIDGE_CHANNEL_INFO_PATH": "data/dnf/" + c.get("channel_file", "channel_info.etc"), "DNFBRIDGE_PVF_PATH": "data/dnf/Script.pvf",
+        "DNFBRIDGE_CHANNEL_INFO_BODY_MODE": "latest", "DNFBRIDGE_CHANNEL_SERVER_INDEX": "1",
+        "DNFBRIDGE_CHANNEL_ADVERTISE_SERVER_INDEX": str(advertised_server), "DNF_SCRIPT_VERSION": "59",
+        "DNFBRIDGE_CURRENT_CLIENT_VERSION": c.get("client_version", "official-24.9"),
+        "DNFBRIDGE_DEFAULT_GROUP_LOGIN_ONLY": str(c.get("default_group_login_only", True)).lower(),
+        "DNFBRIDGE_GAME_UPPER_HEADER": "server16", "DNFBRIDGE_GAME_UPPER_BODY_CODEC": c["body_codec"],
+        "DNFBRIDGE_GAME_UPPER_CLIENT_BODY_CODEC": c["client_body_codec"], "DNFBRIDGE_DPROTO_MODE": "legacy_patch",
+        "DNFBRIDGE_PARTY_UDP_RELAY_MODE": "embedded", "DNFBRIDGE_PARTY_UDP_RELAY_PORT_START": "30000",
+        "DNFBRIDGE_PARTY_UDP_RELAY_PORT_COUNT": str(relay_count), "DNFBRIDGE_ACCOUNT_API_LISTEN": c["server_ip"] + ":17002",
+        "DNFBRIDGE_ACCOUNT_API_DSN": dsn, "DNFBRIDGE_ACCOUNT_API_ALLOW_REGISTER": "true",
+        "DNFBRIDGE_ACCOUNT_API_LOGIN_TOKEN": "true", "DNFBRIDGE_PACKET_LOG": str(c.get("packet_log", False)).lower(),
+        "DNFBRIDGE_JOUST_EVENT_ENABLED": str(c["joust_event_enabled"]).lower(),
+        "GOMEMLIMIT": c.get("go_memory_limit", "3500MiB"),
+        "TZ": c.get("timezone", "Asia/Shanghai"),
+    }
+    if game_token:
+        env["DNFBRIDGE_PLAYER_ADMIN_SECRET"] = game_token
+    if buff_swap_reapply is not None:
+        env["DNFBRIDGE_BUFF_SWAP_REAPPLY"] = buff_swap_reapply
+    if owner_range is not None:
+        env["DNFBRIDGE_CHANNEL_DIRECTORY_OWNER_RANGE"] = owner_range
+    if tournament is not None:
+        env["DNFBRIDGE_DUNGEON_TOURNAMENT"] = tournament
+    if multiplier is not None:
+        env["DNFBRIDGE_MAIN_QUEST_EXP_MULTIPLIER"] = str(multiplier)
+    if percent is not None:
+        env["DNFBRIDGE_MAIN_QUEST_EXP_PERCENT"] = str(percent)
+    env.update(compatibility_env)
+    if buff_group_sync is not None:
+        env[BUFF_GROUP_SYNC_KEY] = buff_group_sync
+    if encoding is not None:
+        env["DNFBRIDGE_CHANNEL_SCRIPT_ENCODING"] = encoding
+    if gold_diagnostic_character is not None:
+        env["DNFBRIDGE_GOLD_DIAGNOSTIC_CHARACTER"] = str(gold_diagnostic_character)
+    if disjoint_epic_display is not None:
+        env["DNFBRIDGE_DISJOINT_EPIC_DISPLAY"] = disjoint_epic_display
+    if town_display_only is not None:
+        env["DNFBRIDGE_TOWN_DISPLAY_ONLY"] = town_display_only
+    write(RUNTIME / "server.env", "".join(f"{k}={v}\n" for k, v in env.items()))
+    write(RUNTIME / "database.env", f"MARIADB_DATABASE=dnf_local\nMARIADB_USER=dnf\nMARIADB_PASSWORD={c['database_password']}\nMARIADB_ROOT_PASSWORD={c['root_password']}\n")
+    logging = {"driver": "json-file", "options": {"max-size": "20m", "max-file": "3"}}
+    spec = {
+        "services": {
+            "db": {"image": c.get("database_image", "mariadb:11.8@sha256:be1ef4fe5f14589325c08a41c76334097ce66c86264b75e1d28342c742782a61"),
+                   "env_file": ["database.env"], "volumes": ["database:/var/lib/mysql"],
+                   "command": ["--bind-address=" + c["database_ip"], "--character-set-server=utf8mb4", "--collation-server=utf8mb4_unicode_ci"],
+                   "networks": {"private": {"ipv4_address": c["database_ip"]}}, "logging": logging,
+                   "healthcheck": {"test": ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"], "interval": "5s", "timeout": "5s", "retries": 30}},
+            "server": {"image": c.get("server_image", IMAGE), "init": True, "stop_grace_period": "45s",
+                       "user": f"{os.getuid()}:{os.getgid()}" if os.name != "nt" else "10001:10001",
+                       "env_file": ["server.env"], "volumes": ["./server:/runtime", "./data:/runtime/data/dnf:ro"],
+                       "depends_on": {"db": {"condition": "service_healthy"}}, "mem_limit": c.get("server_memory_limit", "4g"), "logging": logging,
+                       "networks": {"private": {"ipv4_address": c["server_ip"]}},
+                       "ports": [f"127.0.0.1:{p}:{p}/tcp" for p in (7001, 17002, 18111)] +
+                                [f"{c['host_ip']}:{p}:{p}/tcp" for p in catalog["ports"]] +
+                                [f"{c['host_ip']}:30000-{29999 + relay_count}:30000-{29999 + relay_count}/udp"],
+                       "healthcheck": {"test": ["CMD", "wget", "-Y", "off", "-q", "-O", "/dev/null", f"http://{c['server_ip']}:17002/api/status"],
+                                       "start_period": "180s", "interval": "10s", "timeout": "5s", "retries": 12}},
+        },
+        "networks": {"private": {"ipam": {"config": [{"subnet": c["subnet"]}]}}},
+        "volumes": {"database": {}},
+    }
+    if c.get("database_memory_limit"):
+        spec["services"]["db"]["mem_limit"] = c["database_memory_limit"]
+    if c.get("database_buffer_pool_size"):
+        spec["services"]["db"]["command"].append("--innodb-buffer-pool-size=" + str(c["database_buffer_pool_size"]))
+    for service in spec["services"].values():
+        service["restart"] = c.get("restart", "no")
+    write(RUNTIME / "compose.json", json.dumps(spec, indent=2) + "\n")
+
+
+def main():
+    global RUNTIME, PROJECT, IMAGE
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("action", choices=("prepare", "build", "up", "down", "status", "logs"))
+    parser.add_argument("--pvf")
+    parser.add_argument("--host-ip")
+    parser.add_argument("--client-dir")
+    parser.add_argument("--buff-group-sync", choices=("auto", "on", "off"),
+                        help="Fresh installs select V212+ automatically; use off only for a legacy client")
+    parser.add_argument("--channel-info", help="Explicit path to the common 120-channel baseline; fresh installs use the bundled table")
+    parser.add_argument("--runtime-dir", type=Path, default=RUNTIME)
+    parser.add_argument("--project", default=PROJECT)
+    parser.add_argument("--image", default=IMAGE)
+    args = parser.parse_args()
+    RUNTIME, PROJECT, IMAGE = args.runtime_dir.resolve(), args.project, args.image
+    if args.action == "build":
+        build()
+    elif args.action == "prepare":
+        prepare(args)
+    elif args.action == "up":
+        prepare(args)
+        compose("up", "-d", "--wait", "--wait-timeout", "300")
+    elif args.action == "down":
+        compose("down")  # Never remove the database volume.
+    elif args.action == "status":
+        compose("ps", "-a")
+    else:
+        compose("logs", "--tail", "100")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (ValueError, OSError, subprocess.CalledProcessError) as error:
+        print(f"Deployment stopped: {error}", file=sys.stderr)
+        sys.exit(1)

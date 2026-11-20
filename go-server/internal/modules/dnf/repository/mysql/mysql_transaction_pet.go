@@ -1,0 +1,166 @@
+package mysql
+
+import (
+	"context"
+	"errors"
+	"longheng.io/server/internal/modules/dnf/repository"
+	"strings"
+)
+
+type mysqlCharacterPetUnitOfWork struct {
+	router mysqlRouter
+}
+
+func (u *mysqlCharacterPetUnitOfWork) WithinCharacterPets(
+	ctx context.Context,
+	characterID string,
+	apply func(repository.InventoryRepository, repository.EquipmentRepository, repository.PetRepository) error,
+) error {
+	characterID = strings.TrimSpace(characterID)
+	if characterID == "" || apply == nil || u == nil {
+		return repository.ErrCharacterPetTransactionUnavailable
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	beginner, ok := u.router.db.(sqlTxBeginner)
+	if !ok {
+		return repository.ErrCharacterPetTransactionUnavailable
+	}
+	tx, err := beginTimedObservedSQLTransaction(ctx, beginner)
+	if err != nil {
+		return err
+	}
+	writeDatabase := u.router.writeDBs[pickDatabase(characterID, len(u.router.writeDBs))]
+	txRouter := u.router
+	txRouter.db = newSQLTransactionDB(tx.Tx, txRouter.db)
+	txRouter.readDBs = []string{writeDatabase}
+	txRouter.writeDBs = []string{writeDatabase}
+	txRouter.lockReads = true
+	txGroup := newMySQLGroupFromRouter(txRouter, false)
+	txGroup.Pet.(*mysqlPetStore).trackGrowthChanges = true
+	inventory := &characterPetScopedInventoryRepository{characterID: characterID, base: txGroup.Inventory}
+	equipment := &characterPetScopedEquipmentRepository{characterID: characterID, base: txGroup.Equipment}
+	pets := &characterPetScopedPetRepository{characterID: characterID, base: txGroup.Pet}
+	if err := apply(inventory, equipment, pets); err != nil {
+		return errors.Join(err, rollbackTimedSQLTransaction(ctx, tx))
+	}
+	if err := ctx.Err(); err != nil {
+		return errors.Join(err, rollbackTimedSQLTransaction(ctx, tx))
+	}
+	return commitTimedSQLTransaction(ctx, tx)
+}
+
+type characterPetScopedInventoryRepository struct {
+	characterID string
+	base        repository.InventoryRepository
+}
+
+func (r *characterPetScopedInventoryRepository) Load(ctx context.Context, characterID string) (repository.InventoryRecord, bool, error) {
+	if err := repository.TransactionKeyError(ctx, r.characterID, characterID); err != nil {
+		return repository.InventoryRecord{}, false, err
+	}
+	return r.base.Load(ctx, characterID)
+}
+
+func (r *characterPetScopedInventoryRepository) Save(ctx context.Context, record repository.InventoryRecord) error {
+	if err := repository.TransactionKeyError(ctx, r.characterID, record.CharacterID); err != nil {
+		return err
+	}
+	return r.base.Save(ctx, record)
+}
+
+func (r *characterPetScopedInventoryRepository) SaveFields(ctx context.Context, record repository.InventoryRecord, fields ...repository.InventoryField) error {
+	if err := repository.TransactionKeyError(ctx, r.characterID, record.CharacterID); err != nil {
+		return err
+	}
+	return repository.SaveInventoryFields(ctx, r.base, record, fields...)
+}
+
+func (r *characterPetScopedInventoryRepository) SaveItemStackSlotDelta(ctx context.Context, record repository.InventoryRecord, collection string, keys []string) error {
+	if err := repository.TransactionKeyError(ctx, r.characterID, record.CharacterID); err != nil {
+		return err
+	}
+	if writer, ok := r.base.(repository.ItemStackSlotDeltaWriter); ok {
+		return writer.SaveItemStackSlotDelta(ctx, record, collection, keys)
+	}
+	field := repository.InventoryField(collection)
+	if field != repository.InventoryFieldSlots && field != repository.InventoryFieldWarehouse {
+		return repository.ErrCharacterPetTransactionUnavailable
+	}
+	repository.NotifyInventoryWriteFallback(repository.InventoryWriteFallbackEvent{Target: "inventory", Reason: "repository_does_not_support_delta", Repo: "pet-scoped-base"})
+	return repository.SaveInventoryFields(ctx, r.base, record, field)
+}
+
+type characterPetScopedEquipmentRepository struct {
+	characterID string
+	base        repository.EquipmentRepository
+}
+
+func (r *characterPetScopedEquipmentRepository) Load(ctx context.Context, characterID string) (repository.EquipmentRecord, bool, error) {
+	if err := repository.TransactionKeyError(ctx, r.characterID, characterID); err != nil {
+		return repository.EquipmentRecord{}, false, err
+	}
+	return r.base.Load(ctx, characterID)
+}
+
+func (r *characterPetScopedEquipmentRepository) Save(ctx context.Context, record repository.EquipmentRecord) error {
+	if err := repository.TransactionKeyError(ctx, r.characterID, record.CharacterID); err != nil {
+		return err
+	}
+	return r.base.Save(ctx, record)
+}
+
+func (r *characterPetScopedEquipmentRepository) SaveFields(ctx context.Context, record repository.EquipmentRecord, fields ...repository.EquipmentField) error {
+	if err := repository.TransactionKeyError(ctx, r.characterID, record.CharacterID); err != nil {
+		return err
+	}
+	return repository.SaveEquipmentFields(ctx, r.base, record, fields...)
+}
+
+func (r *characterPetScopedEquipmentRepository) SaveEquipmentEntryDelta(ctx context.Context, record repository.EquipmentRecord, keys []string) error {
+	if err := repository.TransactionKeyError(ctx, r.characterID, record.CharacterID); err != nil {
+		return err
+	}
+	if writer, ok := r.base.(repository.EquipmentEntryDeltaWriter); ok {
+		return writer.SaveEquipmentEntryDelta(ctx, record, keys)
+	}
+	repository.NotifyInventoryWriteFallback(repository.InventoryWriteFallbackEvent{Target: "equipment", Reason: "repository_does_not_support_delta", Repo: "pet-scoped-base"})
+	return repository.SaveEquipmentFields(ctx, r.base, record, repository.EquipmentFieldEntries)
+}
+
+type characterPetScopedPetRepository struct {
+	characterID string
+	base        repository.PetRepository
+}
+
+func (r *characterPetScopedPetRepository) SavePetGrowth(ctx context.Context, record repository.PetRecord, key string, before repository.PetEntry) error {
+	if err := repository.TransactionKeyError(ctx, r.characterID, record.CharacterID); err != nil {
+		return err
+	}
+	return repository.SavePetGrowth(ctx, r.base, record, key, before)
+}
+
+func (r *characterPetScopedPetRepository) Load(ctx context.Context, characterID string) (repository.PetRecord, bool, error) {
+	if err := repository.TransactionKeyError(ctx, r.characterID, characterID); err != nil {
+		return repository.PetRecord{}, false, err
+	}
+	return r.base.Load(ctx, characterID)
+}
+
+func (r *characterPetScopedPetRepository) Save(ctx context.Context, record repository.PetRecord) error {
+	if err := repository.TransactionKeyError(ctx, r.characterID, record.CharacterID); err != nil {
+		return err
+	}
+	return r.base.Save(ctx, record)
+}
+
+func (r *characterPetScopedPetRepository) SaveFields(ctx context.Context, record repository.PetRecord, fields ...repository.PetField) error {
+	if err := repository.TransactionKeyError(ctx, r.characterID, record.CharacterID); err != nil {
+		return err
+	}
+	return repository.SavePetFields(ctx, r.base, record, fields...)
+}

@@ -1,0 +1,151 @@
+package dnfbridge
+
+import (
+	"context"
+	"encoding/binary"
+	"longheng.io/server/internal/modules/dnf/alignedcmd"
+	"longheng.io/server/internal/modules/dnf/dnfenum"
+	dnffatigue "longheng.io/server/internal/modules/dnf/fatigue"
+	dnfinventory "longheng.io/server/internal/modules/dnf/inventory"
+	dnfpvf "longheng.io/server/internal/modules/dnf/pvf"
+	"strconv"
+	"strings"
+)
+
+func fatiguePotionDefinition(itemID int64, path string, document *dnfpvf.Document) (dnffatigue.PotionDefinition, bool) {
+	definition := dnffatigue.PotionDefinition{ItemID: itemID, PVFPath: path}
+	action, found := document.Section("action type")
+	if !found || len(action) < 2 || strings.ToLower(strings.Trim(action[0].Value, "` \t")) != "[add fatigue]" || action[1].Kind != dnfpvf.TokenInt || action[1].Int <= 0 {
+		return definition, false
+	}
+	definition.Points = action[1].Int
+	definition.DailyLimit, _ = document.Int("total usable count")
+	definition.MinimumLevel, _ = document.Int("minimum level")
+	definition.CoolTimeMS, _ = document.Int("cool time")
+	definition.Group, _ = document.Text("cooltime group")
+	if group, found := document.Int("cooltime group"); found {
+		definition.Group = strconv.FormatInt(group, 10)
+	}
+	definition.Group = strings.Trim(definition.Group, "` \t\r\n")
+	return definition, true
+}
+
+// The matched EXE maps [add fatigue] to action 58. Both that action and
+// the persisted item's runtime-PVF definition must agree before any debit.
+const currentFatiguePotionAction uint32 = 58
+
+func (s *Service) handleCurrentFatiguePotionUse(session *gameSession, body []byte) (bool, error) {
+	if session == nil || len(body) < 11 || binary.LittleEndian.Uint32(body[7:11]) != currentFatiguePotionAction {
+		return false, nil
+	}
+	slot := int16(binary.LittleEndian.Uint16(body))
+	reject := func() (bool, error) {
+		return true, s.sendGameUpperRawClass(session, uint16(dnfenum.CmdPacketUseStackableAction), dnfinventory.BuildStackableActionFailure(slot, body[2], byte(currentFatiguePotionAction), 1), 1)
+	}
+	if session.selectedCharacterID == 0 || len(body) != currentQuestClearCouponBodySize || body[2] != 0 || slot < 0 || binary.LittleEndian.Uint32(body[3:7]) != 0 || binary.LittleEndian.Uint32(body[11:15]) != 0 || binary.LittleEndian.Uint32(body[15:19]) != 0 {
+		return reject()
+	}
+	repos, ok := s.repositoryGroup()
+	if !ok || repos.Inventory == nil || repos.Account == nil {
+		return false, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), createWriteTimeout)
+	defer cancel()
+	characterID := strconv.Itoa(int(session.selectedCharacterID))
+	inventory, found, err := repos.Inventory.Load(ctx, characterID)
+	if err != nil {
+		return false, err
+	}
+	if !found {
+		return false, nil
+	}
+	stack, found := inventory.Slots["0:"+strconv.Itoa(int(slot))]
+	if !found || stack.Count <= 0 {
+		return false, nil
+	}
+	catalog, err := s.currentPVFItemCatalog()
+	if err != nil || catalog == nil {
+		return false, err
+	}
+	item, err := catalog.ResolveItem(uint32(stack.ItemID))
+	if err != nil {
+		return false, nil
+	}
+	s.initialEquipmentMu.Lock()
+	archive, err := s.initialEquipmentArchiveLocked()
+	s.initialEquipmentMu.Unlock()
+	if err != nil {
+		return false, err
+	}
+	text, err := archive.ReadText(item.PVFPath)
+	if err != nil {
+		return false, err
+	}
+	document, err := dnfpvf.Parse(item.PVFPath, text)
+	if err != nil {
+		return false, err
+	}
+	definition, supported := fatiguePotionDefinition(stack.ItemID, item.PVFPath, document)
+	if !supported {
+		return false, nil
+	}
+	identity, bound := s.boundGameSessionCharacterSnapshot(session)
+	if !bound || identity.generation == 0 || strconv.Itoa(int(identity.character)) != characterID {
+		return reject()
+	}
+	reservation, err := s.reserveCurrentCharacterAssets(ctx, identity, s.accountIDForSession(session))
+	if err != nil {
+		return reject()
+	}
+	defer s.releaseCurrentCharacterAssets(reservation)
+	session.dungeon.mu.Lock()
+	inDungeon := session.dungeon.runtime != nil
+	session.dungeon.mu.Unlock()
+	if inDungeon {
+		return reject()
+	}
+	account, found, err := repos.Account.Load(ctx, s.accountIDForSession(session))
+	if err != nil {
+		return true, err
+	}
+	if !found {
+		return true, nil
+	}
+	result, err := dnffatigue.RestorePotionWithGuard(ctx, repos, account, characterID, slot, definition, s.gameplayNow(), dnffatigue.PotionUseGuard{
+		Expired: currentDungeonDiscardStackExpired,
+		Revalidate: func() bool {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			return s.currentCharacterAssetReservationValidLocked(reservation)
+		},
+	})
+	if err != nil {
+		s.logGameEvent(session, "game-fatigue-potion-rejected", "char_id", session.selectedCharacterID, "item_id", stack.ItemID, "action_index", binary.LittleEndian.Uint32(body[7:11]), "error", err)
+		return reject()
+	}
+	// Quantities come from the committed owner result, never the preflight count.
+	var calls fatiguePotionCallProgress
+	committedCharacter, committedChannel := session.selectedCharacterID, session.channel.ID
+	defer func() {
+		s.logFatiguePotionCommitted(committedCharacter, committedChannel, slot, definition.ItemID, currentFatiguePotionAction, result.Remaining, calls)
+	}()
+	s.logGameEvent(session, "game-fatigue-potion-used", "char_id", session.selectedCharacterID, "item_id", stack.ItemID, "points", definition.Points, "daily_limit", definition.DailyLimit, "cooltime_ms", definition.CoolTimeMS, "remaining_fatigue", result.Character.Stats["fatigue"])
+	calls.stage = fatiguePotionACKCallFailed
+	if err := s.sendGameUpperRawClass(session, uint16(dnfenum.CmdPacketUseStackableAction), dnfinventory.BuildStackableActionAck(slot, 0, currentFatiguePotionAction), 1); err != nil {
+		return true, err
+	}
+	calls.ackOK = true
+	calls.stage = fatiguePotionInventoryRefreshCallFailed
+	if err := s.sendSelectedIncrementalItemSlotRefreshes(session, "fatigue_potion_after_ack", []alignedcmd.ItemSlotRefresh{{ListType: 0, SlotIndex: slot}}); err != nil {
+		return true, err
+	}
+	calls.inventoryOK = true
+	calls.stage = fatiguePotionFatigueCallFailed
+	err = s.sendGameUpperRawClass(session, currentFatigueMsgID, buildCurrentFatigueBody(result.Character, true), 0)
+	if err == nil {
+		calls.fatigueOK = true
+		calls.stage = fatiguePotionFatigueCallReturnedOK
+		err = s.sendCurrentFatiguePotionUsage(ctx, session, result.Character, inventory, "fatigue_potion_after_use")
+	}
+	return true, err
+}
